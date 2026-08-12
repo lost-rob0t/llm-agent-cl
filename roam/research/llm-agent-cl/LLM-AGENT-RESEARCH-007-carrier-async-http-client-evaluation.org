@@ -1,0 +1,196 @@
+:PROPERTIES:
+:ID: llm-agent-research-007
+:END:
+#+title: Carrier async HTTP client evaluation and hardening options
+#+description: Source-level evaluation of Carrier for llm-agent-cl and the fallback design space for a production asynchronous Common Lisp HTTP transport.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:research:http:carrier:cl-async:libcurl:tls:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| Carrier identity and capability research | Maintainer | PENDING | Review of upstream source and issues | Sources below |
+| Hardened Carrier direction | Maintainer | NOT STARTED | Approved transport design and security tests | None |
+| libcurl-multi fallback direction | Maintainer | NOT STARTED | Approved transport design and dependency review | None |
+| Implementation authorization | Maintainer | NOT STARTED | Approved design | None |
+
+* Research question
+
+Does a real asynchronous Common Lisp HTTP client already exist that can support llm-agent-cl streaming and production requirements, and if not, what is the smallest defensible client to build?
+
+* Answer
+
+Yes: **Carrier** exists. It is a lightweight asynchronous Common Lisp HTTP client built on =cl-async= and =fast-http=. Its upstream ASDF system identifies version =0.1.1= and the MIT license. Its request API returns a Blackbird promise and exposes callbacks for response headers, response-body byte chunks, and completion.
+
+Carrier therefore resolves the earlier ecosystem-search failure: llm-agent-cl does not need to invent an async HTTP API merely because a project named “Lobster” could not be found.
+
+Carrier does **not**, however, satisfy the production security and lifecycle contract unchanged.
+
+* Verified Carrier architecture
+
+Carrier's request path:
+
+1. parses the URL with Quri;
+2. serializes an HTTP/1.1 request;
+3. opens a non-blocking TCP connection with =cl-async= or TLS connection with =cl-async-ssl=;
+4. sends the request data;
+5. feeds received bytes to =fast-http=;
+6. emits response headers when parsed;
+7. emits body byte slices incrementally;
+8. resolves the Blackbird promise when parsing completes;
+9. closes the socket.
+
+This model is compatible with OpenRouter SSE streaming because SSE needs an incremental response byte stream, not HTTP/2 specifically.
+
+* Capability matrix
+
+| Capability | Stock Carrier | llm-agent-cl requirement | Result |
+|------------+---------------+--------------------------+--------|
+| Native non-blocking execution | YES | YES | PASS |
+| Incremental response body | YES | YES | PASS |
+| Response headers before completion | YES | YES | PASS |
+| Promise/future completion | YES | YES | PASS |
+| HTTPS transport | YES | YES | PARTIAL: verification unsafe |
+| Certificate verification | NO in current cl-async-ssl path | YES | FAIL |
+| Hostname verification | Not established by current upstream path | YES | FAIL until proven/fixed |
+| First-class cancellation handle | NO | YES | FAIL |
+| Connect/read timeout controls | Partial | YES | PARTIAL |
+| Absolute deadline | NO | YES | FAIL at library contract level |
+| Connection pooling/reuse | NO | YES for production efficiency | FAIL |
+| TLS context reuse | Not public | SHOULD | FAIL/performance gap |
+| Response streaming | YES | YES | PASS |
+| Request-body streaming | NO | SHOULD for generic transport | GAP |
+| Redirects | YES | YES | PASS |
+| Cookies | YES | OPTIONAL | PASS |
+| HTTP/2 | NO | OPTIONAL initially | GAP |
+| HTTP/3 | NO | OPTIONAL | GAP |
+| Proxy support | Not established in public API | SHOULD | GAP |
+| Production conformance tests | Insufficient upstream evidence | YES | FAIL until project-owned tests exist |
+
+* Critical TLS finding
+
+Carrier's HTTPS path selects =cl-async-ssl:tcp-ssl-connect=. In current upstream =cl-async-ssl=, =tcp-ssl-connect-new= creates a client SSL context, calls =ssl-ctx-set-default-verify-paths=, and then explicitly configures =ssl-ctx-set-verify= with =+ssl-verify-none+=. The source also contains a TODO for better verification support.
+
+The same path sets TLS SNI. SNI does not make the connection authentic; without certificate-chain and hostname verification, a network attacker can impersonate the provider. This is disqualifying for production API-key traffic.
+
+Any future Carrier-based implementation must fail closed on TLS verification. 'Works with HTTPS' is not equivalent to 'secure HTTPS'.
+
+* Cancellation and resource ownership
+
+Carrier returns a promise but not a request object. The network socket is lexical state inside =request=. Carrier closes it on redirects and completion, but a caller cannot use a supported public operation such as =cancel-request= to close an in-flight transfer.
+
+llm-agent-cl needs cancellation to propagate through graph -> agent -> model -> provider -> transport. A hardened Carrier API would need to return a request handle containing at least:
+
+- request identity;
+- promise/result object;
+- socket/transport handle;
+- terminal-state guard;
+- cancellation operation;
+- deadline/timer state;
+- byte counters/observability state.
+
+Cancellation must be idempotent and race-safe with normal completion and error callbacks.
+
+* Connection reuse and performance
+
+Stock Carrier closes a socket after each completed response. That forfeits persistent HTTP/1.1 reuse and repeats TCP/TLS setup. Carrier issue #25 reports that repeated SSL-context initialization dominated a high-rate workload and that reusing the SSL context dramatically increased observed throughput in the reporter's test.
+
+A production provider client should own a bounded connection/TLS context pool or use a transport that already implements safe reuse.
+
+* Upstream maturity evidence
+
+Carrier's latest upstream commit observed during this research is from 2023-11-27. The repository is not archived, but most development history is older. Open issues include TLS-context reuse, SSL compatibility, request-body streaming, and missing HTTPBin coverage.
+
+This does not make Carrier unusable; it means llm-agent-cl cannot outsource its production guarantees to upstream maintenance assumptions.
+
+* Option A: harden Carrier
+
+Advantages:
+
+- native Common Lisp API and event-loop model;
+- very small codebase;
+- already uses byte-stream callbacks appropriate for SSE;
+- MIT license aligns with llm-agent-cl;
+- easy to understand and test exhaustively.
+
+Required hardening before production:
+
+1. replace/fix TLS layer with certificate-chain and hostname verification enabled by default;
+2. add reusable TLS context and bounded connection reuse;
+3. return a cancellable request handle;
+4. implement absolute deadlines and separate connect/read/idle timeout semantics;
+5. define proxy support or explicit unsupported behavior;
+6. fix binary request-body handling and add optional streaming uploads;
+7. add deterministic parser/chunk tests and local TLS fixtures;
+8. test redirect semantics and credential stripping across origins;
+9. add fuzz/property tests around malformed responses and callback races;
+10. define supported Lisp implementations and libuv/OpenSSL versions.
+
+Hardening should preferably happen in a maintained fork or upstreamable patch set, not by monkey-patching private symbols from llm-agent-cl.
+
+* Option B: build a small libcurl-multi Common Lisp client
+
+If Carrier hardening expands into maintaining a TLS stack, the better engineering choice is a small CFFI layer over libcurl's **multi interface**.
+
+The libcurl multi API is explicitly designed for multiple concurrent non-blocking transfers. It supports an event-driven socket interface, callbacks for incremental response data, adding/removing easy handles, connection reuse, and modern HTTP/TLS features. Removing an easy handle provides a natural primitive for cancellation. Modern libcurl can multiplex HTTP/2 and support HTTP/3 when built appropriately.
+
+A new Common Lisp client should remain small and expose llm-agent-cl's transport contract rather than attempting to wrap every libcurl option. Proposed future package boundary:
+
+- =async-http-client= / request handle;
+- =submit-request=;
+- =cancel-request=;
+- header event callback;
+- body byte callback or bounded stream/channel;
+- completion promise;
+- connect/read/idle/absolute deadlines;
+- TLS verification enabled and non-disableable by accident;
+- proxy/TLS configuration as explicit policy;
+- connection pool owned by a client object;
+- deterministic shutdown.
+
+The binding should use libcurl's multi-socket API where possible rather than a polling loop that blocks Lisp execution.
+
+* Recommendation
+
+Do **not** invent a new HTTP parser or TLS implementation.
+
+Use Carrier as the Common Lisp reference and first hardening candidate because it proves the desired async API is natural in Lisp. Before implementation approval, perform a focused design comparing:
+
+- hardened Carrier + repaired TLS stack;
+- a minimal libcurl-multi CFFI client.
+
+Choose Carrier only if its security/cancellation/reuse gaps can be fixed without becoming the maintainer of a fragile OpenSSL integration. Otherwise build the libcurl-multi client and keep Carrier as a conformance/reference implementation.
+
+For OpenRouter specifically, HTTP/1.1 response streaming is sufficient, so HTTP/2 is not a milestone-1 blocker. Correct TLS, cancellation, deadlines, and streaming correctness are blockers.
+
+* Sources
+
+Retrieved 2026-08-12.
+
+- https://github.com/orthecreedence/carrier
+- https://github.com/orthecreedence/carrier/blob/master/README.md
+- https://github.com/orthecreedence/carrier/blob/master/carrier.asd
+- https://github.com/orthecreedence/carrier/blob/master/carrier.lisp
+- https://github.com/orthecreedence/carrier/issues/13
+- https://github.com/orthecreedence/carrier/issues/16
+- https://github.com/orthecreedence/carrier/issues/17
+- https://github.com/orthecreedence/carrier/issues/25
+- https://github.com/orthecreedence/cl-async
+- https://github.com/orthecreedence/cl-async/blob/master/src/ssl/tcp.lisp
+- https://github.com/fukamachi/fast-http
+- https://curl.se/libcurl/c/libcurl-multi.html
+- https://everything.curl.dev/libcurl-http/multiplexing.html
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Added source-level Carrier evaluation, production gap matrix, hardening path, and libcurl-multi fallback. | GPT-5.6 Sol | Carrier/cl-async upstream source and issues; libcurl official documentation |
+
+* Footnotes and Glossary
+
+- *Carrier*: MIT-licensed Common Lisp asynchronous HTTP client built on cl-async and fast-http.
+- *CFFI*: Common Foreign Function Interface for calling native C APIs from Common Lisp.
+- *SNI*: TLS Server Name Indication; routing metadata in the TLS handshake, not identity verification.
+- *Multi-socket API*: libcurl event-driven interface in which the application reacts to socket/timer readiness.

@@ -39,7 +39,19 @@ Fixture streams must be replayed with every byte boundary split, random chunking
 
 **Transport contract tests**
 
-Run identical behavioral suites against Dexador sync and the eventual Lobster async adapter. A provider should not need transport-specific logic.
+Run identical behavioral suites against Dexador sync and every async backend candidate. Carrier is the reference native async implementation, but stock Carrier must fail the production gate until TLS certificate/hostname verification, cancellation, deterministic timeout behavior, and connection reuse are proven. A libcurl-multi backend must pass the same suite if selected. Provider code must not require transport-specific branches.
+
+Required transport security tests include:
+
+- trusted local CA success;
+- self-signed/untrusted certificate failure;
+- hostname mismatch failure;
+- expired certificate failure;
+- SNI routing with independent hostname verification;
+- redirect across origins with authorization stripping policy;
+- cancellation during DNS/connect/TLS/header/body phases;
+- repeated completion/cancellation race safety;
+- connection reuse without credential or response cross-talk.
 
 **Live provider tests**
 
@@ -68,16 +80,17 @@ The library should emit structured events/hooks for model request start/end, str
 
 * Release gate recommendation
 
-A production release requires deterministic tests green, live OpenRouter integration green for the release candidate when credentials are available, no unresolved P0/P1 correctness defects, documented provider capability matrix, documented portability matrix, and explicit unsupported-feature behavior.
+A production release requires deterministic tests green, live OpenRouter integration green for the release candidate when credentials are available, no unresolved P0/P1 correctness defects, documented provider capability matrix, documented transport/TLS matrix, documented portability matrix, and explicit unsupported-feature behavior.
 
 * Sources
 
-Research basis retrieved 2026-08-12 from the LangChain/LangGraph/OpenRouter/MCP sources linked in the sibling research notes, plus the canonical workflow rules mirrored from `starintel-auto-research/AGENTS.md`.
+Research basis retrieved 2026-08-12 from the LangChain/LangGraph/OpenRouter/MCP sources linked in the sibling research notes, Carrier/cl-async source reviewed in research 003/007, and the canonical workflow rules mirrored from `starintel-auto-research/AGENTS.md`.
 
 * Changelog
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
+| 2026-08-12 | Added Carrier/libcurl transport conformance and mandatory TLS-verification test gates. | GPT-5.6 Sol | Research 003/007 |
 | 2026-08-12 | Established deterministic, live, streaming, MCP, transport, and fault-injection release gates. | GPT-5.6 Sol | Cross-source research pass |
 
 * Footnotes and Glossary
