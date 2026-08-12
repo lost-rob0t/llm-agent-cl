@@ -1,0 +1,105 @@
+:PROPERTIES:
+:ID: llm-agent-research-001
+:END:
+#+title: LangChain and LangGraph feature parity research
+#+description: Behavioral capability baseline for a Common Lisp agent library comparable to LangChain and LangGraph.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:research:langchain:langgraph:parity:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| Research accuracy | Maintainer | PENDING | Review against current official docs | Sources below |
+| Parity scope | Maintainer | PENDING | Explicit scope approval | None yet |
+| Implementation authorization | Maintainer | NOT STARTED | Approved design | None |
+
+* Research question
+
+What behavioral capabilities must =llm-agent-cl= expose to be credibly comparable to current LangChain + LangGraph while remaining a reusable Common Lisp library rather than a hosted agent harness?
+
+The user wording “langchain and language” is interpreted as *LangChain and LangGraph* because the requested feature set includes both a LangChain-like model/agent layer and LangGraph-like stateful orchestration. This interpretation remains reviewable.
+
+* Verified baseline
+
+Current LangChain presents a standard model interface across providers and a configurable agent abstraction built from models, tools, prompts, and middleware. Its model layer supports normal invocation, streaming, tool calling, structured output, multimodal content, usage metadata, and conversation messages. LangChain agents maintain message state, execute tool loops, expose middleware, and inherit LangGraph capabilities.
+
+Current LangGraph is the lower-level orchestration layer for long-running, stateful agents. Its documented capability classes include durable execution, persistence/checkpoints, human-in-the-loop interrupts, memory, streaming, deterministic + agentic graph composition, and subgraphs.
+
+* Feature parity matrix
+
+| Capability class | Required parity target | Core library? | Notes |
+|------------------+------------------------+---------------+-------|
+| Provider-neutral chat models | YES | YES | Provider selection must not change caller message model. |
+| Canonical messages/content blocks | YES | YES | System/user/assistant/tool plus multimodal/extensible blocks. |
+| Sync invocation | YES | YES | First-class; Dexador-backed for OpenRouter initially. |
+| Async invocation | YES | YES | Same semantics as sync; concrete Lobster binding unresolved. |
+| Token/content streaming | YES | YES | Typed events, not callback-only strings. |
+| Agent-step/state streaming | YES | YES | Expose model/tool/state progress separately. |
+| Tool calling | YES | YES | Multiple/parallel calls, IDs, schemas, typed errors. |
+| Structured output | YES | YES | Provider-native strategy plus tool-mediated fallback. |
+| Multi-turn conversation | YES | YES | Explicit caller-owned state by default. |
+| Middleware/interceptors | YES | YES | Model, tool, state, retry, policy and observability hooks. |
+| Retries/fallbacks | YES | YES | Bounded and typed; no unsafe retry after ambiguous side effects. |
+| Dynamic model routing | YES | YES | Capability-aware model/provider selection. |
+| Multimodal input/output | YES | YES | Canonical content blocks with provider fallbacks. |
+| Batch model calls | YES | YES | Semantic parity target; transport/provider may optimize later. |
+| Checkpoint abstraction | YES | YES | Storage-neutral interface. |
+| Durable resume | YES | YES | Requires pluggable checkpoint store; no mandatory database. |
+| Interrupt/HITL | YES | YES | Serializable interrupt payload + resume token/state. |
+| Graph/state machine API | YES | YES | Low-level deterministic + agentic nodes/edges. |
+| Subgraphs | YES | YES | Isolated or persistent state modes. |
+| Parallel branches | YES | YES | Deterministic merge semantics required. |
+| Memory | YES | YES | Short-term state + optional long-term store contracts. |
+| MCP | YES | YES | Shared canonical tool/content contracts. |
+| Observability hooks | YES | YES | Library events/traces; no required hosted backend. |
+| Hosted tracing/service | NO | NO | Integrations may be added, but library cannot require a control plane. |
+| Every third-party LangChain integration | NO literal count parity | EXTENSION | Parity means open adapter contracts, not cloning thousands of integrations. |
+
+* Design implications discovered by research
+
+1. The public core should be layered: canonical values/errors -> model/provider contracts -> tools/structured output -> agent loop -> graph/checkpoint layer -> MCP adapters.
+2. The high-level agent API must be implementable on top of the lower-level state/graph primitives, matching the LangChain-over-LangGraph relationship without copying Python object models.
+3. Sync and async are not separate feature sets. They require one semantic contract and different transport/execution bindings.
+4. Streaming must cover both provider token deltas and orchestration events.
+5. Persistence is optional at construction time but its interfaces are core; durable behavior cannot be retrofitted cleanly if state transitions are not explicit from the start.
+
+* Non-goals
+
+- No hosted agent server.
+- No StarIntel-specific actor, database, or schema dependency.
+- No exact Python API clone.
+- No claim that a finite initial provider list equals the entire LangChain integration ecosystem.
+
+* Sources
+
+Retrieved 2026-08-12.
+
+- https://docs.langchain.com/oss/python/langchain/overview
+- https://docs.langchain.com/oss/python/langchain/models
+- https://docs.langchain.com/oss/python/langchain/messages
+- https://docs.langchain.com/oss/python/langchain/agents
+- https://docs.langchain.com/oss/python/langchain/streaming
+- https://docs.langchain.com/oss/python/langchain/middleware/overview
+- https://docs.langchain.com/oss/python/langchain/structured-output
+- https://docs.langchain.com/oss/python/langgraph/overview
+- https://docs.langchain.com/oss/python/langgraph/persistence
+- https://docs.langchain.com/oss/python/langgraph/interrupts
+- https://docs.langchain.com/oss/python/langgraph/use-subgraphs
+
+* Unresolved questions
+
+- Whether embeddings/vector stores/document loaders belong in the first major parity milestone or a later package family.
+- Exact public Common Lisp idioms for async values and graph state should be chosen only after dependency and portability research.
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Established current LangChain/LangGraph behavioral parity matrix. | GPT-5.6 Sol | Official documentation retrieved 2026-08-12 |
+
+* Footnotes and Glossary
+
+- *HITL*: human in the loop.
+- *Checkpoint*: persisted snapshot sufficient to resume or inspect an execution thread.
+- *Semantic parity*: comparable behavior and extension points without copying another language's API shape.

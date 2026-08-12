@@ -1,0 +1,29 @@
+name: research-workflow
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile workflow scripts
+        run: python3 -m py_compile scripts/*.py
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Check mirrored research structure
+        run: python3 scripts/sync.py --check
+      - name: Validate canonical Org research
+        run: python3 scripts/validate-docs.py
+      - name: Validate skill pack
+        run: python3 scripts/validate_agent_pack.py

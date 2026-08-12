@@ -1,0 +1,43 @@
+:PROPERTIES:
+:ID: llm-agent-index-000
+:END:
+#+title: llm-agent-cl canonical research index
+#+description: Canonical research map for the llm-agent-cl multi-provider LLM and agent library.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:index:research:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| Research index | Maintainer | PENDING | Maintainer review | None yet |
+
+* Scope
+
+This index tracks canonical research for a production-oriented Common Lisp library with LangChain + LangGraph class capabilities, OpenRouter as the first provider, sync/async HTTP, streaming, tools, multi-turn state, and MCP. It explicitly does not authorize runtime implementation.
+
+* Canonical research
+
+- [[id:llm-agent-research-001][LangChain and LangGraph feature parity]]
+- [[id:llm-agent-research-002][OpenRouter provider contract]]
+- [[id:llm-agent-research-003][HTTP transport and streaming contract]]
+- [[id:llm-agent-research-004][MCP integration contract]]
+- [[id:llm-agent-research-005][Production readiness and test strategy]]
+- [[id:llm-agent-research-006][Library boundary and architecture implications]]
+
+* Current blockers
+
+1. The exact Common Lisp asynchronous HTTP project referred to as “Lobster” is not yet identified from an authoritative upstream.
+2. No runtime design is approved.
+3. OpenRouter provider-native structured-output details need a field-level conformance pass before implementation.
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Created canonical research index and linked initial deep-research set. | GPT-5.6 Sol | Repository bootstrap research pass |
+
+* Footnotes and Glossary
+
+- *Canonical node*: the authoritative research or design document for a topic.
+- *Parity*: equivalent behavioral capability, not source/API cloning.

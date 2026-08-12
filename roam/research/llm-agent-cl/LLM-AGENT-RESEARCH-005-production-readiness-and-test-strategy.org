@@ -1,0 +1,86 @@
+:PROPERTIES:
+:ID: llm-agent-research-005
+:END:
+#+title: Production readiness and test strategy research
+#+description: Quality gates required before llm-agent-cl can be described as production-ready.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:research:testing:production:ci:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| Test strategy | Maintainer | PENDING | Review of matrix and CI cost | This note |
+| Production claim | Maintainer | NOT STARTED | Passing release gates | Future evidence |
+| Implementation authorization | Maintainer | NOT STARTED | Approved design | None |
+
+* Principle
+
+“Production ready” is an observed release property, not an architecture adjective. The project must not claim it until the failure, compatibility, and integration matrix is automated and green for a release candidate.
+
+* Required test classes
+
+**Deterministic unit/conformance tests**
+
+- canonical message/content round trips;
+- provider request/response fixtures;
+- JSON Schema tool validation;
+- tool-call correlation and parallel ordering;
+- structured-output validation and fallback;
+- middleware ordering and error propagation;
+- graph routing, recursion limits, state merges, subgraphs;
+- checkpoint serialization/resume and corruption handling;
+- interrupt/resume semantics;
+- secret redaction and safe printing.
+
+**Streaming torture tests**
+
+Fixture streams must be replayed with every byte boundary split, random chunking, delayed chunks, SSE comments, multiline data, fragmented UTF-8, fragmented tool JSON, duplicate/late usage, cancellation, consumer failure, and provider errors after prior successful tokens.
+
+**Transport contract tests**
+
+Run identical behavioral suites against Dexador sync and the eventual Lobster async adapter. A provider should not need transport-specific logic.
+
+**Live provider tests**
+
+Credential-gated OpenRouter CI tests must be separate from deterministic tests. They should use a deliberately bounded token/cost budget, a configurable known-compatible model, and assert real non-stream, stream, tool, multi-turn, cancellation where supported, and error behavior. Absence of credentials should skip only this class, not the deterministic suite.
+
+**MCP interoperability tests**
+
+- current 2026-07-28 stdio fixture server/client;
+- current Streamable HTTP fixture;
+- tool/resource/prompt discovery;
+- structured/multimodal tool results;
+- cancellation;
+- selected older protocol fixtures to prove compatibility or explicit rejection.
+
+**Fault injection**
+
+DNS/TLS failures, connect/read timeouts, HTTP 429/5xx, malformed JSON, mid-stream disconnect, repeated tool failures, checkpoint write failure, cancellation races, and retry exhaustion all require typed terminal outcomes.
+
+* Portability and API compatibility
+
+SBCL should be the initial reference implementation environment. Additional Common Lisp implementations should enter the support matrix only after dependencies and CI are verified. Public APIs require semantic versioning and deprecation policy before 1.0 stability claims.
+
+* Observability contract
+
+The library should emit structured events/hooks for model request start/end, stream deltas, tool execution, retries, state transitions, checkpoint operations, token usage, latency, and errors. It must not require a hosted tracing vendor.
+
+* Release gate recommendation
+
+A production release requires deterministic tests green, live OpenRouter integration green for the release candidate when credentials are available, no unresolved P0/P1 correctness defects, documented provider capability matrix, documented portability matrix, and explicit unsupported-feature behavior.
+
+* Sources
+
+Research basis retrieved 2026-08-12 from the LangChain/LangGraph/OpenRouter/MCP sources linked in the sibling research notes, plus the canonical workflow rules mirrored from `starintel-auto-research/AGENTS.md`.
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Established deterministic, live, streaming, MCP, transport, and fault-injection release gates. | GPT-5.6 Sol | Cross-source research pass |
+
+* Footnotes and Glossary
+
+- *Conformance test*: a reusable behavioral test applied to every implementation of an interface.
+- *Release gate*: evidence that must pass before a release can carry a quality claim.
