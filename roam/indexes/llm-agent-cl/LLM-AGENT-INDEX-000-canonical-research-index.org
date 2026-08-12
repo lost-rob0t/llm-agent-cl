@@ -24,17 +24,21 @@ This index tracks canonical research for a production-oriented Common Lisp libra
 - [[id:llm-agent-research-004][MCP integration contract]]
 - [[id:llm-agent-research-005][Production readiness and test strategy]]
 - [[id:llm-agent-research-006][Library boundary and architecture implications]]
+- [[id:llm-agent-research-007][Carrier async HTTP client evaluation and hardening options]]
 
 * Current blockers
 
-1. The exact Common Lisp asynchronous HTTP project referred to as “Lobster” is not yet identified from an authoritative upstream.
-2. No runtime design is approved.
+1. No runtime design is approved.
+2. The production async backend still needs a design choice between a hardened Carrier path and a small libcurl-multi client; stock Carrier is not acceptable unchanged because current TLS verification is disabled and cancellation/connection-reuse contracts are incomplete.
 3. OpenRouter provider-native structured-output details need a field-level conformance pass before implementation.
+
+The earlier “Lobster” identity gap is closed: Carrier is the verified native async Common Lisp HTTP client used as the reference implementation for research.
 
 * Changelog
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
+| 2026-08-12 | Added Carrier evaluation and replaced the unresolved Lobster identity blocker with an explicit production-hardening decision. | GPT-5.6 Sol | Research 003/007 and Carrier/cl-async upstream source |
 | 2026-08-12 | Created canonical research index and linked initial deep-research set. | GPT-5.6 Sol | Repository bootstrap research pass |
 
 * Footnotes and Glossary

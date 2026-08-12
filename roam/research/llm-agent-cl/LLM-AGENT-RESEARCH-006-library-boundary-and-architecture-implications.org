@@ -24,7 +24,7 @@ These are dependency directions for a future design, not implementation package 
 
 1. **Canonical values and errors** — messages, content blocks, usage, tool calls/results, stream events, conditions.
 2. **Execution primitives** — cancellation, deadlines, sync/async result semantics, middleware/event hooks.
-3. **HTTP transports** — Dexador sync and verified Lobster async binding.
+3. **HTTP transports** — Dexador sync plus a production async backend conforming to the same contract; Carrier is the native Common Lisp reference implementation, with hardening or libcurl-multi replacement required before production.
 4. **Provider contracts/adapters** — OpenRouter first; provider capabilities and extensions isolated here.
 5. **Tool + structured-output layer** — schema validation, execution, result correlation.
 6. **High-level agent loop** — repeated model/tool turns, budgets/limits, multi-turn state.
@@ -42,14 +42,14 @@ OpenRouter is the first provider, not the canonical wire model. OpenAI-compatibl
 
 * No hidden global state
 
-Provider credentials, default models, tool registries, conversation state, checkpoint stores, and middleware stacks should be explicit values/configuration supplied by callers. Thread-local/dynamic conveniences may exist later, but the core contract must remain testable and embeddable.
+Provider credentials, default models, tool registries, conversation state, checkpoint stores, middleware stacks, and transport clients should be explicit values/configuration supplied by callers. Thread-local/dynamic conveniences may exist later, but the core contract must remain testable and embeddable.
 
 * First future design prerequisites
 
 Before writing Common Lisp runtime code:
 
 - maintainer approves the research scope;
-- exact Lobster upstream is identified;
+- async transport design selects either a hardened Carrier path or a libcurl-multi client and defines verified TLS/cancellation/reuse semantics;
 - OpenRouter structured-output/capability field research is completed;
 - a design defines canonical values/errors and sync/async semantics;
 - dependency choices for JSON + JSON Schema + concurrency primitives are researched for license/maintenance/portability.
@@ -61,11 +61,13 @@ Before writing Common Lisp runtime code:
 - [[id:llm-agent-research-003][Transport/streaming]]
 - [[id:llm-agent-research-004][MCP]]
 - [[id:llm-agent-research-005][Production readiness]]
+- [[id:llm-agent-research-007][Carrier async HTTP evaluation]]
 
 * Changelog
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
+| 2026-08-12 | Replaced unresolved async-library prerequisite with Carrier/libcurl production transport decision and explicit transport-client ownership boundary. | GPT-5.6 Sol | Research 003/007 |
 | 2026-08-12 | Synthesized research into library-boundary and dependency-direction constraints. | GPT-5.6 Sol | Sibling research notes 001-005 |
 
 * Footnotes and Glossary

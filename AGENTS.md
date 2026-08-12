@@ -79,7 +79,17 @@ For framework parity research record both high-level LangChain-style and low-lev
 
 Dexador is the required synchronous HTTP library.
 
-The user requested an asynchronous Common Lisp HTTP library named `Lobster`. Initial repository/ecosystem research did not identify a verifiable upstream Common Lisp async HTTP client with that name. Until the exact project is identified, research must preserve `Lobster` as an unresolved dependency and MUST NOT silently substitute Carrier, cl-async, Drakma, or another transport. Future architecture must therefore bind async HTTP through an interface with the concrete Lobster adapter blocked on upstream identification.
+Carrier (`orthecreedence/carrier`) is the identified native asynchronous Common Lisp HTTP client and the reference implementation for async transport research. It is MIT-licensed, built on `cl-async` + `fast-http`, returns Blackbird promises, supports response body chunk callbacks, redirects, cookies, timeouts, and HTTPS through `cl-async-ssl`.
+
+Stock Carrier MUST NOT be treated as production-approved without remediation. Current upstream evidence shows:
+
+- `cl-async-ssl` configures client verification with `SSL_VERIFY_NONE`; certificate/hostname verification is therefore not acceptable for production provider traffic.
+- Carrier does not expose a first-class request cancellation handle; the socket is internal to `request`.
+- Carrier closes the socket after each completed response, so connection pooling/reuse is absent.
+- request-body streaming is not implemented upstream.
+- upstream issues document SSL compatibility and TLS-context reuse/performance gaps.
+
+Future designs must preserve the async transport behind a library interface. The preferred order is: (1) evaluate a hardened Carrier fork/adapter with verified TLS, cancellation and connection reuse; (2) if that cannot satisfy the contract cleanly, implement a small Common Lisp async client over libcurl's multi interface. Do not weaken TLS verification to retain Carrier compatibility.
 
 ## Substantive Org documents
 
