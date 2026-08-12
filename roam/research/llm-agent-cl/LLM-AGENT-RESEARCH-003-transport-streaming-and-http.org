@@ -1,0 +1,89 @@
+:PROPERTIES:
+:ID: llm-agent-research-003
+:END:
+#+title: HTTP transport and streaming contract research
+#+description: Sync/async HTTP, SSE streaming, cancellation, retries, backpressure, and the unresolved Lobster dependency.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:research:http:streaming:dexador:lobster:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| Transport research | Maintainer | PENDING | Dependency review | Sources below |
+| Lobster identity | Maintainer | NOT STARTED | Authoritative upstream URL/system name | Unresolved |
+| Implementation authorization | Maintainer | NOT STARTED | Approved design | None |
+
+* Dexador
+
+Dexador is a Common Lisp HTTP client with connection pooling and condition-based HTTP failure behavior. It is MIT licensed and is the required synchronous transport for this project.
+
+Dexador should be hidden behind a transport protocol rather than exposed from provider APIs. Provider code should express request method, URL, headers, body, response mode, deadline/cancellation metadata, and stream sink/event source through library-level contracts.
+
+* Requested Lobster async transport: unresolved
+
+The user explicitly requires “asynchronous lobster for http.” Searches of GitHub and the Common Lisp package/documentation ecosystem during this pass did not identify an authoritative Common Lisp asynchronous HTTP client named =Lobster=. The prominent current project named Lobster is an unrelated TypeScript/OpenClaw workflow runtime.
+
+Therefore:
+
+1. No alternative async HTTP library is selected.
+2. Carrier, cl-async, Drakma, or other libraries must not be silently substituted.
+3. The architecture must define async HTTP semantics independently of a concrete backend.
+4. Implementation of the async backend is blocked until the exact Lobster upstream/system name is identified.
+
+* Unified sync/async semantics
+
+Both transports must expose equivalent outcomes:
+
+- request accepted / response received;
+- response headers available before body completion where streaming requires it;
+- body byte stream or complete body;
+- cancellation;
+- absolute deadline and connect/read timeout policy;
+- typed DNS/TLS/connect/protocol/status/body-decode errors;
+- deterministic cleanup;
+- optional proxy/TLS configuration;
+- connection reuse;
+- observability metadata.
+
+Async invocation must not be “run Dexador in a background thread” unless a later approved design explicitly selects that as a portability fallback. Native async transport behavior is the requirement.
+
+* SSE layer
+
+SSE parsing belongs above HTTP so both transports feed identical bytes/events into one parser. Required parser tests include:
+
+- UTF-8 code points split across reads;
+- CRLF and LF framing;
+- comment/keepalive lines;
+- multiple =data:= lines;
+- events split at every possible byte boundary;
+- terminal =[DONE]= or provider equivalent handling;
+- malformed JSON;
+- a provider error after earlier successful deltas;
+- consumer cancellation and slow-consumer backpressure.
+
+The output should be typed stream events, including content deltas, reasoning/metadata deltas, tool-call deltas, usage, completion, and terminal errors.
+
+* Retry and cancellation rules
+
+Retries must be bounded, policy-driven, jittered where delay applies, and classified by failure stage. Never automatically replay a request after tokens/tool calls have been observed. Cancellation must propagate from agent/graph -> provider -> HTTP transport and produce a typed cancelled terminal state.
+
+* Sources
+
+Retrieved 2026-08-12.
+
+- https://github.com/fukamachi/dexador
+- https://quickdocs.org/dexador
+- https://openrouter.ai/docs/api/reference/streaming
+- GitHub repository search for “lobster Common Lisp HTTP” returned no matching repository during this pass.
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Defined transport/streaming requirements and recorded unresolved Lobster dependency. | GPT-5.6 Sol | Dexador/OpenRouter docs plus repository search |
+
+* Footnotes and Glossary
+
+- *Backpressure*: preventing a producer from unboundedly outrunning a stream consumer.
+- *Transport adapter*: implementation that maps the library's HTTP contract to a concrete HTTP library.

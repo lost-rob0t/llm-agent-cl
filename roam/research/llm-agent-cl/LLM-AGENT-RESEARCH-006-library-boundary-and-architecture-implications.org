@@ -1,0 +1,74 @@
+:PROPERTIES:
+:ID: llm-agent-research-006
+:END:
+#+title: Library boundary and architecture implications
+#+description: Research conclusions that constrain later llm-agent-cl architecture without authorizing implementation.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:research:architecture:boundaries:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| Boundary conclusions | Maintainer | PENDING | Maintainer review | Sibling research notes |
+| Architecture direction | Maintainer | PENDING | Approved future design | None yet |
+| Implementation authorization | Maintainer | NOT STARTED | Approved design | None |
+
+* Boundary conclusion
+
+The project should be a layered embeddable library. It should not own a daemon, web UI, agent hosting service, global database, StarIntel actor runtime, or mandatory scheduler. Applications compose those around the library.
+
+* Layers implied by research
+
+These are dependency directions for a future design, not implementation package names:
+
+1. **Canonical values and errors** — messages, content blocks, usage, tool calls/results, stream events, conditions.
+2. **Execution primitives** — cancellation, deadlines, sync/async result semantics, middleware/event hooks.
+3. **HTTP transports** — Dexador sync and verified Lobster async binding.
+4. **Provider contracts/adapters** — OpenRouter first; provider capabilities and extensions isolated here.
+5. **Tool + structured-output layer** — schema validation, execution, result correlation.
+6. **High-level agent loop** — repeated model/tool turns, budgets/limits, multi-turn state.
+7. **Low-level graph/state layer** — deterministic/agentic nodes, routing, checkpoints, interrupts, subgraphs, parallelism.
+8. **MCP adapters** — translate MCP tools/resources/prompts through existing canonical contracts.
+9. **Optional integrations** — persistence backends, tracing exporters, retrieval/vector systems, application adapters.
+
+* Why the graph/state layer belongs in the library
+
+LangChain currently builds its high-level agents on LangGraph and gains persistence, durable execution, and HITL from that lower layer. If =llm-agent-cl= implements only a recursive tool loop first and treats explicit state/checkpointing as an application concern, later parity would require breaking core execution semantics. Therefore state transitions, cancellation, event streaming, and resumability need to be designed before implementation even when the first milestone uses in-memory state.
+
+* Provider independence rule
+
+OpenRouter is the first provider, not the canonical wire model. OpenAI-compatible JSON is useful adapter input/output but cannot define the full core because other providers expose different reasoning, multimodal, tool, cache, citation, and metadata structures. Unknown provider-native data needs a deliberate extension escape hatch.
+
+* No hidden global state
+
+Provider credentials, default models, tool registries, conversation state, checkpoint stores, and middleware stacks should be explicit values/configuration supplied by callers. Thread-local/dynamic conveniences may exist later, but the core contract must remain testable and embeddable.
+
+* First future design prerequisites
+
+Before writing Common Lisp runtime code:
+
+- maintainer approves the research scope;
+- exact Lobster upstream is identified;
+- OpenRouter structured-output/capability field research is completed;
+- a design defines canonical values/errors and sync/async semantics;
+- dependency choices for JSON + JSON Schema + concurrency primitives are researched for license/maintenance/portability.
+
+* Related research
+
+- [[id:llm-agent-research-001][Feature parity]]
+- [[id:llm-agent-research-002][OpenRouter]]
+- [[id:llm-agent-research-003][Transport/streaming]]
+- [[id:llm-agent-research-004][MCP]]
+- [[id:llm-agent-research-005][Production readiness]]
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Synthesized research into library-boundary and dependency-direction constraints. | GPT-5.6 Sol | Sibling research notes 001-005 |
+
+* Footnotes and Glossary
+
+- *Embedding*: using the library inside another application/process rather than requiring an external service.
+- *Extension escape hatch*: explicit storage for provider-native fields that canonical types do not standardize.

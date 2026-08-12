@@ -1,0 +1,72 @@
+:PROPERTIES:
+:ID: llm-agent-research-004
+:END:
+#+title: MCP client and server integration research
+#+description: Current Model Context Protocol requirements and mapping into llm-agent-cl canonical tools/content.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:research:mcp:tools:resources:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| MCP research | Maintainer | PENDING | Review against current specification | Sources below |
+| MCP scope | Maintainer | PENDING | Decide client/server milestone | None yet |
+| Implementation authorization | Maintainer | NOT STARTED | Approved design | None |
+
+* Current protocol baseline
+
+The current =latest= MCP specification resolved to version 2026-07-28 during research on 2026-08-12. This matters because the protocol has evolved materially from 2025-era connection/session assumptions.
+
+The current base protocol uses JSON-RPC 2.0 with stateless, self-contained requests and per-request protocol/capability metadata. Standard bindings are stdio and Streamable HTTP. Current Streamable HTTP sends each message via HTTP POST and can return either a JSON response or a request-scoped SSE stream. Current stdio remains newline-delimited JSON-RPC over a client-launched subprocess.
+
+Current transport semantics also define cancellation differently per binding: stdio sends a cancellation notification; Streamable HTTP abandons the response stream. Earlier revisions used connection-scoped initialization/session behavior and server-initiated requests, so backwards compatibility must be explicit rather than assumed.
+
+* Server features to map
+
+- Tools: discovery/list, JSON Schema input, optional output schema, structured/unstructured multimodal results, pagination/caching, list-change notifications.
+- Resources: URI-addressed context, templates/discovery, subscriptions where supported, text/blob content and annotations.
+- Prompts: discoverable prompt templates.
+- Utilities/extensions: cancellation, progress, errors, optional current extensions.
+
+Current tools may return text, image, audio, resource links, embedded resources, and structured JSON. This maps naturally onto the same canonical content-block and JSON-schema abstractions required by native model tools.
+
+* Recommended library split from research
+
+1. =MCP client layer=: connect to one or more servers and convert discovered MCP tools/resources/prompts to canonical library values.
+2. =Tool adapter layer=: expose MCP tools to agents without making the agent loop understand MCP.
+3. =MCP server layer=: optionally expose library-native tools/resources/prompts through MCP as a separate module.
+4. =Transport bindings=: stdio and Streamable HTTP remain independent from protocol semantics.
+5. =Compatibility layer=: version-aware codecs/behavior for selected older MCP revisions, tested with fixtures.
+
+Client support is the first requirement because it directly satisfies “agent can use MCP tools.” Server export is valuable for composability but should not block the first provider/agent milestone.
+
+* Security requirements
+
+- Treat remote tool annotations/descriptions as untrusted input.
+- Keep user/caller authorization hooks outside model control.
+- Validate schemas and tool results.
+- Do not expose credentials through tool parameters, logs, traces, or headers accidentally.
+- Streamable HTTP must obey current origin/auth/security requirements when server support is implemented.
+
+* Sources
+
+Retrieved 2026-08-12.
+
+- https://modelcontextprotocol.io/specification/latest (resolved to 2026-07-28)
+- https://modelcontextprotocol.io/specification/2026-07-28/basic/transports
+- https://modelcontextprotocol.io/specification/2026-07-28/server/tools
+- https://modelcontextprotocol.io/specification/2026-07-28/server/resources
+- https://docs.langchain.com/oss/python/langchain/mcp
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Researched current MCP 2026-07-28 semantics and library mapping. | GPT-5.6 Sol | MCP official specification retrieved 2026-08-12 |
+
+* Footnotes and Glossary
+
+- *MCP*: Model Context Protocol.
+- *Streamable HTTP*: MCP's standard HTTP binding using POST and request-scoped JSON/SSE responses.
+- *Protocol era*: a revision family with materially different lifecycle/message-pattern rules.

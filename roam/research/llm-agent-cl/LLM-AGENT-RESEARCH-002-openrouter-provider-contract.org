@@ -1,0 +1,67 @@
+:PROPERTIES:
+:ID: llm-agent-research-002
+:END:
+#+title: OpenRouter provider contract research
+#+description: Current OpenRouter API behavior required for the first llm-agent-cl provider adapter.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:research:openrouter:provider:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| Provider research | Maintainer | PENDING | Review against OpenRouter docs | Sources below |
+| First-provider selection | Maintainer | PENDING | Explicit approval | User request |
+| Implementation authorization | Maintainer | NOT STARTED | Approved design | None |
+
+* Verified facts
+
+OpenRouter exposes an OpenAI-compatible HTTP API and standardizes tool calling across models/providers. The stable chat-completions path supports =messages=, model selection, tools, and =stream: true=. Streaming uses Server-Sent Events (SSE). OpenRouter can emit SSE comment lines as keepalive/processing signals; consumers must ignore valid SSE comments rather than parse every line as JSON.
+
+Streaming tool calls arrive incrementally and therefore require assembly by tool-call index/ID before arguments are parsed as complete JSON. A final chunk can include usage metadata. Errors that occur after HTTP 200 may be delivered inside the stream as a terminal event with an error payload and =finish_reason: error=.
+
+OpenRouter documents stream cancellation by closing/aborting the connection; immediate upstream cancellation support varies by provider. The generation ID is also exposed in the =X-Generation-Id= response header and should be preserved as provider metadata.
+
+OpenRouter also exposes an OpenAI-compatible Responses API, but its current documentation labels it beta and stateless. Therefore it is not a sound sole production foundation for the first adapter. The initial adapter should research chat-completions as the compatibility baseline while keeping endpoint families behind provider capabilities.
+
+* Required provider adapter behaviors
+
+- Authentication from caller-supplied secret/config only; never global hard-coded state.
+- Model discovery/capability caching with explicit staleness policy.
+- Canonical request translation from provider-neutral messages/content/tools.
+- Provider extension map for OpenRouter-only routing and metadata fields.
+- Non-stream and stream response normalization.
+- Preservation of usage, finish reason, model/provider metadata, tool-call IDs, and generation identifiers.
+- Typed HTTP errors, provider errors, malformed responses, and mid-stream errors.
+- Cancellation and deadline propagation to the HTTP transport.
+- Explicit unsupported-capability errors rather than silent field dropping.
+- Retry classification that distinguishes safe pre-submit failures from ambiguous or partially streamed submissions.
+
+* Tool loop requirements
+
+OpenRouter follows the common tool-call loop: append the assistant tool-call message to conversation history, execute each requested tool, append correlated tool results, then invoke the model again. The core agent layer, not the OpenRouter adapter, should own this loop.
+
+* Structured output gap
+
+A field-level conformance pass is still required for OpenRouter structured-output parameters and per-model capability discovery before implementation. This research intentionally does not invent those request fields from OpenAI memory.
+
+* Sources
+
+Retrieved 2026-08-12.
+
+- https://openrouter.ai/docs/quickstart
+- https://openrouter.ai/docs/guides/features/tool-calling
+- https://openrouter.ai/docs/api/reference/streaming
+- https://openrouter.ai/docs/api/reference/responses/overview
+- https://openrouter.ai/docs/faq
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Created first-provider research with streaming/tool/error constraints. | GPT-5.6 Sol | OpenRouter official docs retrieved 2026-08-12 |
+
+* Footnotes and Glossary
+
+- *SSE*: Server-Sent Events, the event framing used by OpenRouter streaming.
+- *Ambiguous submission*: a request whose server-side execution status is unknown after a transport failure.

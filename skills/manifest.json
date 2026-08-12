@@ -1,0 +1,27 @@
+{
+  "name": "llm-agent-cl-research-pack",
+  "version": "0.1.0",
+  "canonical_instructions": "AGENTS.md",
+  "skill_count": 19,
+  "skills": [
+    {"name":"search-roam","category":"workflow","path":"skills/search-roam/SKILL.md","description":"Find the smallest canonical research context."},
+    {"name":"save-research","category":"workflow","path":"skills/save-research/SKILL.md","description":"Create sourced canonical Org research."},
+    {"name":"source-verification","category":"workflow","path":"skills/source-verification/SKILL.md","description":"Verify changing technical claims against primary sources."},
+    {"name":"branch-workflow","category":"workflow","path":"skills/branch-workflow/SKILL.md","description":"Reconcile repository state and isolate work."},
+    {"name":"implement-one-design","category":"workflow","path":"skills/implement-one-design/SKILL.md","description":"Activate exactly one approved design in a project slot."},
+    {"name":"mark-implemented","category":"workflow","path":"skills/mark-implemented/SKILL.md","description":"Record a successful terminal implementation handoff."},
+    {"name":"mark-rejected","category":"workflow","path":"skills/mark-rejected/SKILL.md","description":"Record a rejected design handoff."},
+    {"name":"create-design-file","category":"design","path":"skills/create-design-file/SKILL.md","description":"Create a linked design only after research approval."},
+    {"name":"review-design","category":"design","path":"skills/review-design/SKILL.md","description":"Review architecture, boundaries, dependencies and acceptance criteria."},
+    {"name":"design-to-issues","category":"design","path":"skills/design-to-issues/SKILL.md","description":"Split an approved design into dependency-ordered issues."},
+    {"name":"feature-parity","category":"research","path":"skills/feature-parity/SKILL.md","description":"Measure behavioral parity against LangChain and LangGraph."},
+    {"name":"provider-research","category":"research","path":"skills/provider-research/SKILL.md","description":"Research provider API contracts and capability discovery."},
+    {"name":"model-contract","category":"research","path":"skills/model-contract/SKILL.md","description":"Research canonical provider-neutral model and message types."},
+    {"name":"transport-contract","category":"research","path":"skills/transport-contract/SKILL.md","description":"Research sync/async HTTP, deadlines, cancellation and retries."},
+    {"name":"streaming-contract","category":"research","path":"skills/streaming-contract/SKILL.md","description":"Research typed streaming, SSE, backpressure and partial failures."},
+    {"name":"tool-contract","category":"research","path":"skills/tool-contract/SKILL.md","description":"Research tool schemas, execution loops, parallelism and structured output."},
+    {"name":"mcp-contract","category":"research","path":"skills/mcp-contract/SKILL.md","description":"Research current MCP client/server contracts and transports."},
+    {"name":"agent-runtime-contract","category":"research","path":"skills/agent-runtime-contract/SKILL.md","description":"Research agent loops, graphs, state, middleware and interrupts."},
+    {"name":"production-readiness","category":"research","path":"skills/production-readiness/SKILL.md","description":"Define production quality, compatibility and test requirements."}
+  ]
+}
