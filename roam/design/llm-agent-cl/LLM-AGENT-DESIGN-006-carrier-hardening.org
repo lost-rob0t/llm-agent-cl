@@ -13,6 +13,7 @@
 | Carrier public API evolution | Maintainer | PENDING | Review compatibility/new handle API | This design |
 | TLS security design | Maintainer | PENDING | Review fail-closed verification plan | Research 007 |
 | Pooling/cancellation/deadline design | Maintainer | PENDING | Review lifecycle state machine | This design |
+| Resource ownership/close semantics | Maintainer | PENDING | Review concrete API below | This design |
 | Carrier implementation authorization | Maintainer | NOT STARTED | Explicit approval of this design | None |
 
 * Target repository and boundary
@@ -23,6 +24,19 @@ At design time the fork's =master= tree is still the upstream Carrier =95ea9edba
 
 Carrier remains a standalone generic asynchronous HTTP client. Do not introduce llm-agent-cl, OpenRouter, MCP, StarIntel or agent concepts into Carrier.
 
+* Design invariants
+
+1. TLS verification fails closed and validates both certificate chain and endpoint identity.
+2. Exactly one terminal request transition occurs.
+3. Cancellation is idempotent and works in every non-terminal phase.
+4. A client owns its pools/TLS contexts/timers; a request handle owns one logical request.
+5. Late parser/socket/timer callbacks cannot resurrect a terminal request.
+6. Pool keys include every policy dimension that can make two connections unsafe to share.
+7. Request/response bodies are octet-correct; arbitrary binary data never round-trips through text formatting.
+8. Queue, body, header, redirect and pool dimensions are bounded.
+9. Cross-origin redirects do not leak credentials by default.
+10. Legacy convenience API inherits the hardened core rather than preserving insecure implementation paths.
+
 * Compatibility goal
 
 Preserve the existing =carrier:request= convenience API where practical so existing callers do not need a flag-day rewrite. Implement it through the new client/request core so all callers inherit secure TLS and lifecycle fixes.
@@ -31,39 +45,72 @@ Security-breaking historical behavior is not preserved. In particular, successfu
 
 * Proposed new public objects/API
 
-**client** owns reusable resources and policy:
+** client
 
-- event-loop integration;
-- TLS context/trust policy;
-- bounded connection pools;
-- proxy policy;
-- default timeouts/deadline limits;
-- redirect policy;
-- max response/header limits;
-- shutdown state.
+A client owns reusable resources and policy.
 
-**request-handle** owns one in-flight operation:
+#+begin_src lisp
+(defclass client ()
+  ((state :initform :open :accessor client-state)
+   (loop :initarg :loop :reader client-loop)
+   (tls-policy :initarg :tls-policy :reader client-tls-policy)
+   (tls-context-cache :initform (make-hash-table :test 'equal)
+                      :reader client-tls-context-cache)
+   (pools :initform (make-hash-table :test 'equal)
+          :reader client-pools)
+   (limits :initarg :limits :reader client-limits)
+   (timeouts :initarg :timeouts :reader client-timeouts)
+   (redirect-policy :initarg :redirect-policy :reader client-redirect-policy)))
+#+end_src
 
-- request id;
-- client reference;
-- socket/connection lease;
-- Blackbird promise/result compatibility handle;
-- terminal state/condition;
-- deadline/timers;
-- response status/headers;
-- byte counters;
-- redirect history;
-- cancellation flag/reason.
+Client state:
 
-Proposed operations (names reviewable):
+#+begin_src text
+OPEN -> CLOSING -> CLOSED
+  |
+  +---- fatal loop/client failure -> FAILED/CLOSED
+#+end_src
 
-- =make-client=;
-- =submit-request= -> request-handle plus/future;
-- =request-handle-promise=;
-- =cancel-request=;
-- =request-state=;
-- =close-client=;
-- legacy =request= convenience implemented using a default/temporary client policy.
+No new request is accepted after =CLOSING= begins.
+
+** request-handle
+
+A request handle owns one logical in-flight operation.
+
+#+begin_src lisp
+(defclass request-handle ()
+  ((id :initarg :id :reader request-id)
+   (client :initarg :client :reader request-client)
+   (state :initform :new :accessor request-state)
+   (promise :initarg :promise :reader request-handle-promise)
+   (connection-lease :initform nil :accessor request-connection-lease)
+   (deadline :initarg :deadline :initform nil :reader request-deadline)
+   (timers :initform '() :accessor request-timers)
+   (status :initform nil :accessor request-status)
+   (headers :initform nil :accessor request-headers)
+   (bytes-sent :initform 0 :accessor request-bytes-sent)
+   (bytes-received :initform 0 :accessor request-bytes-received)
+   (redirect-history :initform '() :accessor request-redirect-history)
+   (terminal-condition :initform nil :accessor request-terminal-condition)))
+#+end_src
+
+Proposed operations:
+
+#+begin_src lisp
+(make-client &key loop tls-policy limits timeouts redirect-policy ...)
+
+(submit-request client method uri
+                &key headers body response-callback
+                     header-callback timeout deadline ...)
+;; => request-handle
+
+(request-handle-promise handle)
+(cancel-request handle &optional reason)
+(request-state handle)
+(close-client client &key wait)
+#+end_src
+
+Legacy =request= convenience is implemented through this core and returns the historical promise-style result where compatibility requires it.
 
 Do not require callers to reach into =cl-async= socket internals.
 
@@ -72,62 +119,149 @@ Do not require callers to reach into =cl-async= socket internals.
 States:
 
 - =:new=;
-- =:resolving/connecting=;
+- =:pool-wait=;
+- =:resolving=;
+- =:connecting=;
 - =:tls-handshake= where applicable;
 - =:request-sending=;
 - =:response-headers=;
 - =:streaming=;
 - terminal =:completed=, =:failed=, =:cancelled=.
 
-Redirects create a controlled next-attempt transition/history while preserving one logical request handle. Exactly one terminal transition is allowed. Late libuv/parser/timer callbacks check terminal state and become no-ops except diagnostics/resource release.
+#+begin_src text
+ NEW
+  |
+  v
+POOL-WAIT? -> RESOLVING -> CONNECTING -> TLS-HANDSHAKE
+                                     \         /
+                                      v       v
+                                    REQUEST-SENDING
+                                          |
+                                          v
+                                   RESPONSE-HEADERS
+                                          |
+                                          v
+                                      STREAMING
+                                          |
+                                          v
+                                      COMPLETED
+
+Every non-terminal state --cancel/error/deadline--> CANCELLED/FAILED
+#+end_src
+
+Redirects create a controlled next-attempt transition/history while preserving one logical request handle.
+
+* Terminal transition primitive
+
+All completion paths go through one internal primitive.
+
+#+begin_src lisp
+(defun try-terminal-transition (handle new-state &optional condition)
+  ;; Under a short internal lock/atomic section:
+  ;; 1. assert NEW-STATE is terminal.
+  ;; 2. if current state already terminal, return NIL.
+  ;; 3. store terminal state/condition exactly once.
+  ;; Then outside the lock:
+  ;; 4. cancel timers/waits.
+  ;; 5. release/retire connection lease.
+  ;; 6. resolve/reject promise once.
+  ;; 7. return T to the winner.
+  ...)
+#+end_src
+
+Late libuv/parser/timer callbacks check terminal state and become no-ops except diagnostics/resource release.
+
+Callbacks that invoke user code do not execute while internal locks are held.
 
 * TLS verification
 
-Production client TLS must verify **both chain and hostname** before application response bytes are exposed.
+Production client TLS must verify **both chain and hostname/IP identity** before application response bytes are exposed.
 
 Required handshake behavior:
 
 1. create/reuse a client TLS context configured with system or explicitly configured CA trust;
 2. enable peer verification (=SSL_VERIFY_PEER= or equivalent);
-3. set SNI to requested DNS host;
-4. verify OpenSSL chain result after handshake;
-5. verify hostname against leaf certificate using =X509_check_host= or equivalent supported API;
-6. fail request before HTTP parsing if any validation fails;
-7. include safe typed TLS failure metadata without certificate secrets.
+3. set SNI to requested DNS host where appropriate;
+4. perform handshake;
+5. verify OpenSSL chain result;
+6. verify DNS hostname against leaf certificate using =X509_check_host= or equivalent;
+7. for IP literals, use =X509_check_ip=/appropriate IP path;
+8. fail request before HTTP parsing if any validation fails;
+9. include safe typed TLS failure metadata without secret/request-header leakage.
 
-IP literal verification should use the appropriate OpenSSL IP verification path rather than treating it as a DNS hostname.
+#+begin_src text
+TCP CONNECTED
+    |
+    v
+TLS HANDSHAKE
+    |
+    +-- chain invalid ------> FAIL
+    |
+    +-- name/IP invalid ----> FAIL
+    |
+    v
+VERIFIED TLS CONNECTION
+    |
+    v
+HTTP REQUEST ALLOWED
+#+end_src
 
-If a supported OpenSSL/cl-async-ssl combination cannot perform hostname validation safely, startup/client creation should signal unsupported TLS capability rather than silently using =VERIFY_NONE=.
+SNI is not hostname verification. A successful TLS handshake without identity validation is not considered secure success.
+
+If a supported OpenSSL/cl-async-ssl combination cannot perform hostname validation safely, client creation or HTTPS submission signals unsupported TLS capability rather than silently using =VERIFY_NONE=.
 
 * TLS implementation boundary
 
 Preferred implementation:
 
 - add safe verification/context hooks to Carrier's own TLS adapter layer while using =cl-async-ssl= for nonblocking BIO/socket plumbing;
-- isolate any additional CFFI calls in =carrier.tls= or equivalent internal module;
+- isolate additional CFFI calls in =carrier.tls= or equivalent internal module;
 - detect OpenSSL API availability at load/client initialization;
-- add compatibility code/tests for the supported OpenSSL versions.
+- add compatibility code/tests for supported OpenSSL versions.
 
 Do not make llm-agent-cl responsible for private =cl-async-ssl= symbols. If fixing =cl-async-ssl= upstream/fork is clearly cleaner, that change requires its own reviewed dependency action, but Carrier still exposes the stable public security contract.
 
-* Trust configuration
+* TLS trust policy object
 
-Secure defaults:
+#+begin_src lisp
+(defclass tls-policy ()
+  ((verify-peer-p :initarg :verify-peer-p :initform t
+                  :reader tls-policy-verify-peer-p)
+   (ca-file :initarg :ca-file :initform nil :reader tls-policy-ca-file)
+   (ca-directory :initarg :ca-directory :initform nil
+                 :reader tls-policy-ca-directory)
+   (min-version :initarg :min-version :initform nil
+                :reader tls-policy-min-version)
+   (client-certificate :initarg :client-certificate :initform nil
+                       :reader tls-policy-client-certificate)))
+#+end_src
 
-- use system default trust roots;
-- optional explicit CA file/directory/trust configuration;
-- certificate verification enabled by default and not disabled by a surprising convenience keyword;
-- any deliberate insecure mode, if retained for localhost test fixtures, must be loudly named, opt-in, non-default and documented as unsafe. llm-agent-cl production adapter will not expose it.
+Any deliberate insecure mode, if retained for local fixtures, must use a loudly named constructor/flag such as =make-insecure-test-tls-policy= and must never be selected implicitly.
 
-* Connection pooling
+llm-agent-cl's production Carrier adapter will not expose insecure mode.
 
-Client owns per-origin pools keyed by at least:
+* Connection pool key
+
+Client owns per-origin pools keyed by every sharing-sensitive dimension.
+
+#+begin_src lisp
+(defstruct pool-key
+  scheme
+  host
+  port
+  proxy-identity
+  tls-policy-id
+  client-certificate-id)
+#+end_src
+
+At minimum key includes:
 
 - scheme;
 - host;
 - port;
 - proxy identity/policy;
-- TLS trust/client-cert policy where relevant.
+- TLS trust policy;
+- client-certificate policy where relevant.
 
 HTTP/1.1 first implementation:
 
@@ -137,9 +271,39 @@ HTTP/1.1 first implementation:
 - bounded max connections per origin and globally;
 - idle timeout and max idle count;
 - validate no unread response bytes before returning to pool;
-- close all idle/in-use leases deterministically on client shutdown/cancellation policy.
+- close all idle connections deterministically on client shutdown;
+- active requests are cancelled or allowed to drain according to explicit close policy.
 
-A pool wait queue must be bounded/cancellable/deadline-aware.
+* Connection lease
+
+A request never manipulates the pool's idle list directly. It receives a lease object owned until release/retire.
+
+#+begin_src lisp
+(defclass connection-lease ()
+  ((connection :initarg :connection :reader lease-connection)
+   (pool :initarg :pool :reader lease-pool)
+   (released-p :initform nil :accessor lease-released-p)))
+
+(release-connection lease) ; healthy reusable response complete
+(retire-connection lease)  ; protocol/error/cancel/close; never reused
+#+end_src
+
+Both operations are idempotent. A request terminal path must do exactly one logical lease disposition.
+
+* Pool wait queue
+
+When no connection slot is available:
+
+#+begin_src text
+request -> bounded pool wait queue
+              |
+              +-- connection available -> lease
+              +-- cancellation ---------> remove + cancelled
+              +-- deadline -------------> remove + timeout
+              +-- client closing -------> remove + client-closed
+#+end_src
+
+Wait queue size is bounded. Overflow signals a typed pool-capacity condition rather than growing memory without bound.
 
 * TLS context reuse
 
@@ -147,9 +311,21 @@ Client owns reusable TLS context(s) keyed by trust/cipher/version policy. Contex
 
 Changing trust policy creates a distinct/new context; never mutate one shared context under active connections in unsafe ways.
 
-* HTTP request serialization
+* HTTP request representation
 
-Replace text-round-trip request construction with octet-correct serialization.
+Internal normalized request before serialization:
+
+#+begin_src lisp
+(defclass http-request ()
+  ((method :initarg :method :reader http-request-method)
+   (uri :initarg :uri :reader http-request-uri)
+   (headers :initarg :headers :initform nil :reader http-request-headers)
+   (body :initarg :body :initform nil :reader http-request-body)
+   (max-response-bytes :initarg :max-response-bytes :initform nil
+                       :reader http-request-max-response-bytes)))
+#+end_src
+
+Serialization is octet-correct.
 
 - method/token and header names/values validated against injection/CRLF rules;
 - request target/path/query encoded deliberately;
@@ -163,70 +339,121 @@ Host header includes port where required and correctly handles IPv6 literals.
 
 * Streaming upload interface
 
-Producer abstraction supplies bounded octet chunks asynchronously/on demand. It must support:
+#+begin_src lisp
+(defclass body-producer () ())
 
-- backpressure from socket writability;
+(defgeneric producer-content-length (producer)) ; integer or NIL
+(defgeneric producer-next-chunk (producer callback errback))
+(defgeneric cancel-producer (producer reason))
+(defgeneric rewind-producer (producer))
+#+end_src
+
+Producer abstraction supplies bounded octet chunks asynchronously/on demand and supports:
+
+- socket-write backpressure;
 - EOF;
 - producer error;
 - cancellation;
 - known/unknown total length;
-- maximum request body policy.
+- maximum request body policy;
+- explicit rewindability.
 
 Do not buffer an unbounded producer just to compute length.
+
+Producer callbacks after request terminal state are discarded and any producer resource is closed/cancelled exactly once.
 
 * Response parser limits
 
 Continue using =fast-http= initially, wrapped with project limits:
 
 - maximum status/header bytes;
-- maximum single header count/value size where feasible;
-- optional maximum buffered body when =return-body=;
-- streaming callback receives bounded valid slice;
-- parser exceptions normalized and close connection;
+- maximum header count;
+- maximum single header/value size where feasible;
+- optional maximum buffered body when returning body;
+- streaming callback receives bounded valid slices;
+- parser exceptions normalize and retire connection;
 - EOF rules distinguish valid close-delimited completion from truncation.
+
+Limits are checked before allocation growth where possible.
 
 * Redirect policy
 
 Support explicit 301/302/303/307/308 semantics.
 
+#+begin_src lisp
+(defclass redirect-policy ()
+  ((max-hops :initarg :max-hops :initform 10 :reader redirect-max-hops)
+   (allow-https-downgrade-p :initarg :allow-https-downgrade-p
+                            :initform nil
+                            :reader redirect-allow-downgrade-p)
+   (sensitive-headers :initarg :sensitive-headers
+                      :initform '("authorization"
+                                  "proxy-authorization"
+                                  "cookie")
+                      :reader redirect-sensitive-headers)))
+#+end_src
+
 Rules:
 
 - resolve relative Location against current URL;
-- track visited URLs/hop count and fail on configured max/loop;
+- track visited URLs/hop count and fail on max/loop;
 - 307/308 preserve method/body;
 - 303 becomes GET except HEAD semantics as appropriate;
-- 301/302 compatibility behavior for non-GET is an explicit policy rather than accidental recursion;
-- cross-origin redirect strips =Authorization=, =Proxy-Authorization= and caller-designated sensitive headers by default;
+- 301/302 behavior for non-GET is explicit policy rather than accidental recursion;
+- cross-origin redirect strips Authorization/Proxy-Authorization and caller-designated sensitive headers by default;
 - cookies follow cookie-jar origin/security rules;
 - HTTPS -> HTTP downgrade is rejected by secure default unless explicitly allowed;
-- replaying a streaming/non-rewindable request body across redirect is rejected unless producer is declared rewindable.
+- replaying a streaming/non-rewindable request body across redirect is rejected unless producer is rewindable.
+
+Redirect attempt history records sanitized URI/status/method transitions without credentials.
 
 * Cancellation
 
 =cancel-request= is idempotent.
 
-When cancellation wins:
+#+begin_src lisp
+(defun cancel-request (handle &optional (reason :cancelled))
+  (when (try-terminal-transition
+         handle
+         :cancelled
+         (make-condition 'request-cancelled :reason reason))
+    t))
+#+end_src
 
-- cancel timers/waits;
-- remove request from pool wait queue or close/retire active connection as necessary;
+Winning cancellation cleanup includes:
+
+- cancel timers;
+- remove request from DNS/connect/pool wait callback registrations;
 - stop upload producer;
-- reject/complete promise once with =request-cancelled= condition;
+- retire active connection if protocol safety requires it;
 - suppress subsequent response callbacks;
+- reject/complete promise once with =request-cancelled=;
 - release all request-owned resources exactly once.
 
-Cancellation during DNS/connect/TLS/send/headers/body/pool-wait gets dedicated regression tests.
+Cancellation during pool-wait/DNS/connect/TLS/send/headers/body gets dedicated regression tests.
 
 * Timeout and deadline model
 
 Client/request supports:
 
-- connect timeout;
-- TLS handshake timeout (may be part of connect but separately observable);
+- pool-wait timeout where configured;
+- DNS/connect timeout;
+- TLS handshake timeout;
 - read/idle timeout reset by inbound progress;
 - write/idle timeout reset by outbound progress;
 - absolute request deadline.
 
-Absolute deadline caps every phase. The earliest timer wins; terminal-state guard prevents multiple rejection callbacks.
+#+begin_src lisp
+(defstruct timeout-policy
+  connect-seconds
+  tls-handshake-seconds
+  read-idle-seconds
+  write-idle-seconds)
+#+end_src
+
+Absolute deadline caps every phase. The earliest timer may attempt terminal transition; the terminal guard prevents multiple rejection callbacks.
+
+Timers are removed/cancelled after terminal transition so stale callbacks do not accumulate.
 
 * Proxy support
 
@@ -234,15 +461,54 @@ Before claiming generic production readiness, either implement explicit HTTP CON
 
 Proxy authentication credentials follow the same redaction and redirect/origin protection rules.
 
+Pool keys distinguish proxy policy/identity so direct and proxied connections cannot be mixed.
+
 * Cookie behavior
 
-Retain =cl-cookie= compatibility but make cookie jar client/request scoped rather than hidden global state. Secure/SameSite/domain/path semantics rely on the cookie library; add regression tests for redirect/domain leakage relevant to HTTP client behavior.
+Retain =cl-cookie= compatibility but make cookie jar client/request scoped rather than hidden global state. Secure/domain/path behavior relies on the cookie library; add regression tests for redirect/domain leakage relevant to HTTP client behavior.
+
+Cookie jars are injectable resources. Caller-injected jar remains caller-owned unless ownership is explicitly transferred.
+
+* Client shutdown
+
+=close-client= is idempotent.
+
+Recommended policies:
+
+- default =:cancel-active= for deterministic library shutdown;
+- optional =:drain= with bounded deadline for callers that intentionally want active requests to finish.
+
+#+begin_src text
+OPEN --close--> CLOSING
+                |
+                +-- stop accepting requests
+                +-- close idle connections
+                +-- cancel or drain active according policy
+                +-- clear pool waiters
+                +-- release TLS contexts/loop-owned resources
+                v
+              CLOSED
+#+end_src
+
+No resource finalizer is relied on for normal shutdown.
 
 * Observability
 
-Optional callbacks/events include request start, DNS/connect/TLS timings where observable, headers, bytes sent/received, redirect, reuse/new connection, cancellation, completion/failure.
+Optional callbacks/events include request start, DNS/connect/TLS timings where observable, headers, bytes sent/received, redirect, reuse/new connection, pool wait, cancellation, completion/failure.
 
-Never log Authorization/Cookie/Proxy-Authorization or TLS secrets. Header logging uses redaction policy.
+Representative sanitized event:
+
+#+begin_src lisp
+'(:request-complete
+  :request-id "r-17"
+  :origin "https://openrouter.ai:443"
+  :status 200
+  :bytes-sent 812
+  :bytes-received 12491
+  :connection-reused t)
+#+end_src
+
+Never log Authorization/Cookie/Proxy-Authorization or TLS secrets. Header logging uses redaction policy and is opt-in.
 
 * Error conditions
 
@@ -256,10 +522,46 @@ Carrier should expose a coherent condition hierarchy for:
 - response limits;
 - redirect policy;
 - cancelled;
-- pool/client closed;
-- producer/upload error.
+- pool/client closed/capacity;
+- producer/upload error;
+- unsupported proxy/TLS capability.
+
+Representative root:
+
+#+begin_src lisp
+(define-condition carrier-error (error)
+  ((request-id :initarg :request-id :initform nil :reader carrier-error-request-id)
+   (phase :initarg :phase :initform nil :reader carrier-error-phase)))
+
+(define-condition tls-verification-error (carrier-error)
+  ((host :initarg :host :reader tls-error-host)
+   (verification-code :initarg :verification-code :initform nil
+                      :reader tls-error-verification-code)))
+#+end_src
 
 Keep compatibility with existing condition handling where reasonable by subclassing/aliasing rather than deleting old conditions without migration notes.
+
+* Legacy request compatibility path
+
+Old convenience call:
+
+#+begin_src lisp
+(carrier:request "https://example.com"
+                 :method :get
+                 :callback #'handle-body)
+#+end_src
+
+Implementation becomes conceptually:
+
+#+begin_src lisp
+(defun request (uri &rest legacy-options)
+  (let ((client (resolve-or-create-legacy-client legacy-options)))
+    (submit-request-from-legacy-options client uri legacy-options)))
+#+end_src
+
+There must not be a separate old TLS/socket path. Compatibility only adapts arguments/return shape.
+
+If the legacy API historically relied on hidden global loop/client state, migration notes must make ownership/shutdown behavior explicit.
 
 * CI and deterministic fixture suite
 
@@ -267,29 +569,37 @@ Add GitHub Actions for SBCL reference environment plus system packages required 
 
 Local fixture servers/tests must cover:
 
-**TLS**
+** TLS
+
 - trusted local CA + correct hostname succeeds;
 - self-signed/untrusted fails;
 - expired/not-yet-valid fails;
 - correct CA but wrong hostname fails;
 - alternate hostname/SAN cases;
+- IP SAN verification;
 - reused context still verifies per-host connection correctly.
 
-**Lifecycle**
-- cancel in each state;
-- timeout/deadline in each relevant state;
-- repeated cancellation/completion races (thousands of deterministic/repetition iterations as practical);
-- client shutdown with idle and active requests;
-- no double promise resolution/rejection.
+** Lifecycle
 
-**Pooling**
-- same-origin reuse observed;
+- cancel in every non-terminal state;
+- timeout/deadline in each relevant state;
+- repeated cancellation/completion races;
+- client shutdown with idle and active requests;
+- no double promise resolution/rejection;
+- late callbacks after terminal state are harmless.
+
+** Pooling
+
+- same-origin/policy reuse observed;
 - =Connection: close= not reused;
 - origin/TLS/proxy policy isolation;
 - pool limit wait/cancel/deadline;
-- idle expiration.
+- wait queue capacity failure;
+- idle expiration;
+- cancelled/parse-failed connection retired, never reused.
 
-**HTTP**
+** HTTP
+
 - binary body round trip;
 - chunked streaming upload;
 - incremental response chunks;
@@ -299,6 +609,31 @@ Local fixture servers/tests must cover:
 - cookies.
 
 Add leak/resource tests observing file descriptors/connections where feasible.
+
+** Terminal race stress example
+
+#+begin_src lisp
+(test request-terminal-transition-is-exactly-once
+  (loop repeat 10000
+        do (let ((handle (make-controllable-request-handle)))
+             (race
+              (lambda () (fixture-complete handle))
+              (lambda () (cancel-request handle :test))
+              (lambda () (fixture-timeout handle)))
+             (is (= 1 (fixture-terminal-count handle))))))
+#+end_src
+
+** Pool isolation test
+
+#+begin_src lisp
+(test tls-policy-is-part-of-pool-key
+  (let ((strict (make-client :tls-policy strict-policy))
+        (custom (make-client :tls-policy custom-ca-policy)))
+    (request-and-drain strict "https://fixture.test/")
+    (request-and-drain custom "https://fixture.test/")
+    (is (not (eq (fixture-last-connection strict)
+                 (fixture-last-connection custom))))))
+#+end_src
 
 * Release plan
 
@@ -317,15 +652,47 @@ No release may claim TLS-safe production use until all verification fixtures pas
 
 Recommended Carrier PR sequence:
 
-1. test/CI foundation + request state guard;
-2. secure TLS context and hostname verification;
-3. request handle + cancellation/deadline;
+1. CI/fixture foundation + explicit request/client state/terminal guard;
+2. secure TLS policy/context + hostname/IP verification;
+3. request handle + cancellation/deadline + shutdown semantics;
 4. octet-safe request serialization + streaming upload;
-5. connection/TLS-context pooling;
-6. redirect security + proxy explicitness;
-7. compatibility docs, stress/leak suite and =0.2.0= release.
+5. connection lease + bounded pooling/TLS-context reuse;
+6. redirect security + cookie/proxy explicitness;
+7. compatibility API migration through new core;
+8. stress/leak suite + docs + =0.2.0= release.
 
-Each slice stays independently testable. llm-agent-cl async integration waits for the required secure/lifecycle slices rather than tracking half-hardened master as “production.”
+Each slice stays independently testable. llm-agent-cl async integration waits for required secure/lifecycle slices rather than tracking half-hardened master as “production.”
+
+* Rejected alternatives
+
+** Keep insecure VERIFY_NONE default for compatibility
+
+Rejected. Security-breaking behavior is not a compatibility promise.
+
+** Hide the in-flight socket and expose only a promise
+
+Rejected because real cancellation and lifecycle introspection require a first-class request handle.
+
+** Pool by host/port only
+
+Rejected because trust/client-certificate/proxy policy differences can make reuse unsafe.
+
+** Run user callbacks under request/pool locks
+
+Rejected because it creates deadlock/reentrancy hazards and makes terminal cleanup difficult to reason about.
+
+** Unlimited connection/wait queues
+
+Rejected because provider bursts can turn transient backpressure into uncontrolled resource growth.
+
+* Open design questions for maintainer approval
+
+1. Whether =submit-request= returns only request-handle or multiple values request-handle + promise. Recommendation: request-handle only, with =request-handle-promise= accessor, keeping one authoritative operation object.
+2. Default client close policy. Recommendation: =:cancel-active=; explicit bounded =:drain= optional.
+3. Whether Carrier itself exposes monotonic absolute deadlines or only absolute timeout timestamps through a clock abstraction. Recommendation: monotonic deadline object internally/publicly enough for deterministic tests.
+4. Whether insecure test TLS mode remains public. Recommendation: if retained, place behind explicitly named test/debug API and documentation; never simple =:verify nil= convenience in normal constructor.
+5. Whether proxy implementation is required for =0.2.0=. It is acceptable to ship =proxy-unsupported= if the option surface cannot silently imply support.
+6. Whether cookie jar remains enabled automatically for legacy =request=. Whatever compatibility choice is made, new =client= API should make jar ownership explicit.
 
 * Historical contingency
 
@@ -342,6 +709,7 @@ The libcurl-multi alternative remains documented in research 007 but is not auth
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
+| 2026-08-12 | Expanded concrete client/request/lease APIs, pool identity, terminal transition, shutdown and compatibility behavior. | GPT-5.6 Sol | Design review pass |
 | 2026-08-12 | Created maintained-fork Carrier production hardening design with TLS, cancellation, pooling, serialization, redirect and release gates. | GPT-5.6 Sol | Research 003/007 and maintainer fork decision |
 
 * Footnotes and Glossary
@@ -349,3 +717,4 @@ The libcurl-multi alternative remains documented in research 007 but is not auth
 - *Connection lease*: temporary ownership of a pooled connection by one request.
 - *Rewindable producer*: streaming body source capable of restarting identically after an allowed redirect/retry.
 - *Fail closed*: abort when verification/security cannot be established instead of falling back to insecure operation.
+- *Terminal guard*: single state-transition primitive ensuring one request completion/failure/cancellation winner.
