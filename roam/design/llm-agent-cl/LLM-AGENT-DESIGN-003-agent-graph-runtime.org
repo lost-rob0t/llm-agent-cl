@@ -13,7 +13,25 @@
 | Graph execution semantics | Maintainer | PENDING | Review reducers/supersteps/Send/Command | This design |
 | Persistence/interrupt semantics | Maintainer | PENDING | Review checkpoint/resume model | This design |
 | High-level agent construction | Maintainer | PENDING | Review model/tool graph | This design |
+| Task identity/commit model | Maintainer | PENDING | Review deterministic scheduler contract | This design |
 | Implementation authorization | Maintainer | NOT STARTED | Explicit approval | None |
+
+* Goal and invariants
+
+Build the graph runtime first and make =make-agent= a convenience graph constructor. The high-level agent must never become a second hidden recursive runtime with incompatible checkpoint, streaming or cancellation semantics.
+
+Invariants:
+
+1. Only committed graph state is visible as the base input to a superstep.
+2. Tasks never mutate shared committed state directly; they return contributions.
+3. One scheduler owns graph state transitions, similar to an actor owning its mailbox/state, without requiring an external actor framework.
+4. Reducer order is deterministic and never depends on hash-table iteration or thread scheduling.
+5. A superstep either commits one coherent next state or remains uncommitted.
+6. Successful task contributions may be persisted as pending writes for fault recovery before the superstep commit.
+7. Task, checkpoint and interrupt identities are stable enough for replay/resume.
+8. External side effects are never implied to be transactional merely because graph state is checkpointed.
+9. Every queue/fan-out/recursion dimension has an explicit bound.
+10. Graph mechanics are deterministic given the same task results and checkpoint lineage.
 
 * Systems
 
@@ -24,9 +42,47 @@ Proposed systems:
 - =llm-agent/graph= — state schemas/reducers/nodes/edges/executor/commands/events;
 - =llm-agent/agent= — high-level model/tool agent assembled on graph primitives.
 
+#+begin_src text
+                 llm-agent/agent
+                       |
+                       v
+                  llm-agent/graph
+                  /      |      \
+                 /       |       \
+          checkpoint    store    tools/provider
+                 \       |       /
+                  \      |      /
+                   runtime/context
+                        |
+                    concurrency
+#+end_src
+
 * State schema
 
-A graph state schema defines named channels/keys and a reducer for each key. A reducer combines an existing value with one or more updates. Built-ins should include:
+A graph state schema defines named channels/keys and a reducer for each key.
+
+Representative values:
+
+#+begin_src lisp
+(defclass state-channel ()
+  ((name :initarg :name :reader channel-name)
+   (reducer :initarg :reducer :reader channel-reducer)
+   (initial-value :initarg :initial-value :reader channel-initial-value)
+   (validator :initarg :validator :initform nil :reader channel-validator)))
+
+(defclass state-schema ()
+  ((channels :initarg :channels :reader schema-channels)))
+#+end_src
+
+A reducer combines an existing committed value with an ordered sequence of task contributions.
+
+#+begin_src lisp
+(defclass reducer () ())
+
+(defgeneric reduce-contributions (reducer old-value contributions context))
+#+end_src
+
+Built-ins should include:
 
 - replace/last-value;
 - append sequence;
@@ -35,11 +91,71 @@ A graph state schema defines named channels/keys and a reducer for each key. A r
 - set union;
 - caller-supplied function.
 
-Reducers must declare or document algebraic expectations. Parallel writes to a non-commutative/non-associative reducer need deterministic ordering or an explicit conflict policy. Silent scheduler-dependent results are forbidden.
+** Reducer determinism
+
+Every contribution carries a deterministic ordering key:
+
+#+begin_src lisp
+(defstruct state-contribution
+  channel
+  value
+  task-id
+  ordinal)
+#+end_src
+
+Reducers that are not commutative operate over contributions sorted by canonical task order, never scheduler completion order.
+
+Example:
+
+#+begin_src text
+completion order: task-C, task-A, task-B
+canonical task order: task-A, task-B, task-C
+reducer input order: A, B, C
+#+end_src
+
+A reducer may declare itself commutative/associative for optimization, but the reference implementation still produces deterministic results.
+
+Parallel writes to a “single writer/replace” channel from multiple tasks are an explicit conflict by default, not “last thread wins.”
+
+#+begin_src lisp
+(define-condition parallel-write-conflict (graph-error)
+  ((channel :initarg :channel :reader conflict-channel)
+   (task-ids :initarg :task-ids :reader conflict-task-ids)))
+#+end_src
+
+* State representation
+
+Committed state is an immutable/logically immutable snapshot map from channel name to value.
+
+#+begin_src lisp
+(defclass graph-state ()
+  ((schema :initarg :schema :reader graph-state-schema)
+   (values :initarg :values :reader graph-state-values)
+   (version :initarg :version :reader graph-state-version)))
+
+(defun state-ref (state key)
+  ...)
+#+end_src
+
+Nodes receive snapshots; they do not receive a mutable shared hash table that they can destructively modify.
 
 * Nodes and edges
 
-A node receives state plus runtime context and returns one of:
+A node receives state plus runtime context and returns one normalized node outcome.
+
+#+begin_src lisp
+(defclass graph-node ()
+  ((name :initarg :name :reader node-name)
+   (function :initarg :function :reader node-function)))
+
+(defclass node-outcome ()
+  ((updates :initarg :updates :initform nil :reader outcome-updates)
+   (routes :initarg :routes :initform nil :reader outcome-routes)
+   (sends :initarg :sends :initform nil :reader outcome-sends)
+   (interrupt :initarg :interrupt :initform nil :reader outcome-interrupt)))
+#+end_src
+
+For ergonomic node functions, the runtime normalizes these accepted return forms:
 
 - state update map;
 - =command= combining update + route/resume intent;
@@ -47,37 +163,161 @@ A node receives state plus runtime context and returns one of:
 - interrupt request;
 - async/future result resolving to one of these.
 
-Edges may be static, conditional on state/result, or dynamic via =send=. Nodes are identified by stable names for checkpoints/traces/replay.
+Static/conditional edges are compiled into graph routing tables.
 
-* Superstep execution
+#+begin_src lisp
+(let ((graph (make-state-graph schema)))
+  (add-node graph :plan #'plan-node)
+  (add-node graph :execute #'execute-node)
+  (add-edge graph :start :plan)
+  (add-conditional-edge graph :plan #'plan-route)
+  (compile-graph graph))
+#+end_src
 
-Use bulk-synchronous supersteps comparable to current LangGraph semantics:
-
-1. determine runnable tasks from committed state/routes;
-2. snapshot each task's input;
-3. execute independent tasks concurrently up to executor limit;
-4. collect successful writes and routing intents;
-5. persist pending task writes if checkpointer supports fault recovery;
-6. if required tasks fail, do not commit a partial new graph state;
-7. on successful barrier, reduce writes deterministically and commit one new checkpoint/state version;
-8. schedule the next superstep.
-
-Parallelism is bounded by the explicit executor. One failed task does not require rerunning already-successful sibling tasks after resume if their pending writes were durably stored.
+Node names are stable identifiers used in tasks, checkpoints, events and replay diagnostics.
 
 * Send
 
-A =send= carries a destination node plus task-local input/state overlay. It enables dynamic map/fan-out from one graph state. Fan-out task identity must be stable enough for checkpoint/pending-write recovery. Results merge only through declared state reducers.
+A =send= carries a destination node plus task-local input/state overlay.
+
+#+begin_src lisp
+(defclass send ()
+  ((destination :initarg :destination :reader send-destination)
+   (input :initarg :input :reader send-input)
+   (key :initarg :key :initform nil :reader send-key)))
+
+(defun fan-out-documents (state context)
+  (declare (ignore context))
+  (map 'list
+       (lambda (doc)
+         (make-instance 'send
+                        :destination :summarize-one
+                        :key (document-id doc)
+                        :input `((:document . ,doc))))
+       (state-ref state :documents)))
+#+end_src
+
+Dynamic task id derives from parent task id + destination + stable send key/ordinal. Callers should provide a stable =:key= when fan-out items have stable identity.
+
+#+begin_src text
+parent task: step-4/plan
+send key: doc-17
+child task id: step-5/summarize-one/doc-17
+#+end_src
+
+Fan-out has hard configured maxima per node and run. Exceeding the bound signals =graph-limit-exceeded= before allocating an unbounded task set.
 
 * Command
 
-A =command= may:
+A =command= may update state and change control flow atomically at the node-result level.
 
-- update graph state;
-- route to one or more destinations;
-- resume an interrupt with a supplied value;
-- target parent graph routing where subgraph rules allow it.
+#+begin_src lisp
+(defclass command ()
+  ((updates :initarg :updates :initform nil :reader command-updates)
+   (goto :initarg :goto :initform nil :reader command-goto)
+   (resume :initarg :resume :initform nil :reader command-resume)
+   (target :initarg :target :initform :current :reader command-target)))
+
+(defun decide-node (state context)
+  (declare (ignore context))
+  (if (state-ref state :done-p)
+      (make-instance 'command :goto :end)
+      (make-instance 'command
+                     :updates '((:attempts . 1))
+                     :goto :work)))
+#+end_src
 
 This prevents awkward separation between “return update” and “decide next edge” for agentic nodes.
+
+* Task descriptor and identity
+
+Each runnable task is explicit data:
+
+#+begin_src lisp
+(defclass graph-task ()
+  ((id :initarg :id :reader task-id)
+   (node :initarg :node :reader task-node)
+   (superstep :initarg :superstep :reader task-superstep)
+   (input :initarg :input :reader task-input)
+   (attempt :initarg :attempt :initform 0 :reader task-attempt)
+   (parent-id :initarg :parent-id :initform nil :reader task-parent-id)))
+#+end_src
+
+Task ids must be reproducible from checkpoint/run topology rather than random per process. An internal UUID may still be attached for tracing, but recovery keys use deterministic identity.
+
+* Superstep execution
+
+Use bulk-synchronous supersteps comparable to current LangGraph semantics.
+
+** Scheduler state machine
+
+#+begin_src text
+LOAD COMMITTED STATE
+        |
+        v
+BUILD RUNNABLE TASK SET
+        |
+        v
+DISPATCH (bounded executor)
+        |
+        v
+COLLECT OUTCOMES / PERSIST PENDING WRITES
+        |
+        +---- any required task failed ----> STEP FAILED / resumable checkpoint
+        |
+        v
+DETERMINISTIC REDUCE
+        |
+        v
+ATOMIC CHECKPOINT COMMIT
+        |
+        v
+NEXT SUPERSTEP or TERMINAL
+#+end_src
+
+Detailed algorithm:
+
+1. load committed state/checkpoint;
+2. determine runnable tasks from committed routes;
+3. sort/assign deterministic task identities;
+4. snapshot each task input;
+5. execute independent tasks concurrently up to executor limit;
+6. normalize each node return into =node-outcome=;
+7. validate state contribution channels/types/limits;
+8. persist successful pending writes if supported;
+9. if required tasks fail, do not commit a partial next graph state;
+10. on successful barrier, sort contributions canonically;
+11. reduce per channel;
+12. validate resulting state and serialized-size limit;
+13. commit exactly one checkpoint/state version;
+14. derive next task set and continue.
+
+One failed task does not require rerunning already-successful sibling tasks after resume if their pending writes were durably stored and still match the checkpoint/superstep identity.
+
+* Pending writes
+
+Pending writes are task-local successful contributions stored before the full superstep commits.
+
+#+begin_src lisp
+(defclass pending-write ()
+  ((thread-id :initarg :thread-id :reader pending-thread-id)
+   (checkpoint-id :initarg :checkpoint-id :reader pending-checkpoint-id)
+   (superstep :initarg :superstep :reader pending-superstep)
+   (task-id :initarg :task-id :reader pending-task-id)
+   (outcome :initarg :outcome :reader pending-outcome)
+   (digest :initarg :digest :reader pending-digest)))
+#+end_src
+
+Recovery rule:
+
+#+begin_src text
+same checkpoint + same superstep + same task-id + valid pending write
+    -> reuse successful outcome
+otherwise
+    -> execute task again
+#+end_src
+
+Pending writes must never be applied to a different parent checkpoint lineage.
 
 * Checkpoint model
 
@@ -91,21 +331,125 @@ A checkpoint record contains at least:
 - next/runnable task descriptors;
 - task metadata/errors/interrupts;
 - channel/version metadata sufficient for conflict detection;
-- created timestamp and custom metadata.
+- created timestamp and custom metadata;
+- graph/schema serialization version.
 
-The checkpointer protocol supports load latest, load by id, list history, write checkpoint and write/read pending task contributions. In-memory checkpointer is the first implementation; persistent adapters follow the same protocol.
+Representative shape:
+
+#+begin_src lisp
+(defclass checkpoint ()
+  ((thread-id :initarg :thread-id :reader checkpoint-thread-id)
+   (namespace :initarg :namespace :reader checkpoint-namespace)
+   (id :initarg :id :reader checkpoint-id)
+   (parent-id :initarg :parent-id :initform nil :reader checkpoint-parent-id)
+   (state :initarg :state :reader checkpoint-state)
+   (next-tasks :initarg :next-tasks :initform nil :reader checkpoint-next-tasks)
+   (interrupts :initarg :interrupts :initform nil :reader checkpoint-interrupts)
+   (schema-version :initarg :schema-version :reader checkpoint-schema-version)
+   (metadata :initarg :metadata :initform nil :reader checkpoint-metadata)))
+#+end_src
+
+* Checkpointer protocol
+
+#+begin_src lisp
+(defclass checkpointer () ())
+
+(defgeneric load-latest-checkpoint (checkpointer thread-id &key namespace))
+(defgeneric load-checkpoint (checkpointer thread-id checkpoint-id &key namespace))
+(defgeneric list-checkpoints (checkpointer thread-id &key namespace limit before))
+(defgeneric commit-checkpoint (checkpointer checkpoint expected-parent-id))
+(defgeneric put-pending-write (checkpointer pending-write))
+(defgeneric list-pending-writes (checkpointer thread-id checkpoint-id superstep))
+#+end_src
+
+=commit-checkpoint= uses compare-and-swap/expected-parent semantics where the backend can support concurrent writers. If the lineage head moved unexpectedly, signal =checkpoint-conflict= rather than overwriting history.
+
+In-memory checkpointer is the first implementation. Persistent adapters follow the same protocol.
+
+* Checkpoint serialization/versioning
+
+Persistent values require an explicit codec/version boundary.
+
+#+begin_src lisp
+(defgeneric encode-checkpoint-value (codec checkpoint))
+(defgeneric decode-checkpoint-value (codec octets))
+#+end_src
+
+Never persist arbitrary unreadable CLOS closures/functions as graph state. State schemas intended for persistent use must contain values supported by the configured codec or custom serializers.
+
+Checkpoint schema/version mismatch behavior is typed and testable; migrations are explicit.
 
 * Thread identity and multi-turn memory
 
 A high-level conversation can bind to a graph thread id. With a checkpointer, message state survives separate invocations. Without one, state remains caller-owned/in-memory for that run.
 
+#+begin_src lisp
+(run-graph compiled-agent
+           '((:messages . (#<user-message ...>)))
+           :thread-id "chat-42"
+           :checkpointer db-checkpointer)
+#+end_src
+
 Thread ids and checkpoint ids are caller-visible data, never implicit process globals.
 
 * Interrupt and resume
 
-A node may produce an interrupt payload at a deterministic point. The runtime persists checkpoint/task state before returning control. Public result includes interrupt id/payload and thread/checkpoint identity.
+A node may produce an interrupt payload at a deterministic point.
 
-Resume supplies one or more values through a =command= or resume API. Re-execution semantics must be documented: code before an interrupt may execute again after resume, so users are warned to place non-idempotent side effects behind idempotency/transaction boundaries or after the resume point.
+#+begin_src lisp
+(defun approval-node (state context)
+  (declare (ignore context))
+  (if (state-ref state :approved-p)
+      '((:status . :approved))
+      (interrupt :approval-required
+                 `((:proposal . ,(state-ref state :proposal))))))
+#+end_src
+
+The runtime persists checkpoint/task state before returning control.
+
+Public interrupt result contains:
+
+#+begin_src lisp
+(defclass graph-interrupt ()
+  ((id :initarg :id :reader interrupt-id)
+   (kind :initarg :kind :reader interrupt-kind)
+   (payload :initarg :payload :reader interrupt-payload)
+   (thread-id :initarg :thread-id :reader interrupt-thread-id)
+   (checkpoint-id :initarg :checkpoint-id :reader interrupt-checkpoint-id)
+   (task-id :initarg :task-id :reader interrupt-task-id)))
+#+end_src
+
+Resume:
+
+#+begin_src lisp
+(resume-graph compiled-agent
+              :thread-id "chat-42"
+              :checkpoint-id interrupted-checkpoint-id
+              :interrupt-id approval-interrupt-id
+              :value '((:approved . t)))
+#+end_src
+
+** Re-execution rule
+
+Node code before the interrupt site may execute again after resume depending on node implementation/checkpoint granularity. The runtime therefore does *not* promise exactly-once external side effects.
+
+Bad:
+
+#+begin_src lisp
+(defun bad-node (...)
+  (charge-credit-card)    ; may run again
+  (interrupt :confirm)
+  ...)
+#+end_src
+
+Preferred:
+
+#+begin_src lisp
+(defun safer-node (state context)
+  (if (state-ref state :confirmed-p)
+      (charge-with-idempotency-key (state-ref state :operation-id))
+      (interrupt :confirm)))
+#+end_src
 
 * Time travel
 
@@ -116,28 +460,72 @@ Support:
 - fork from an earlier checkpoint with state updates;
 - continue fork under a new lineage/checkpoint id.
 
+Representative API:
+
+#+begin_src lisp
+(list-graph-history graph :thread-id "chat-42")
+
+(replay-graph graph
+              :thread-id "chat-42"
+              :checkpoint-id "cp-17")
+
+(fork-graph graph
+            :thread-id "chat-42"
+            :checkpoint-id "cp-17"
+            :updates '((:temperature . 0.1))
+            :new-thread-id "chat-42-alt")
+#+end_src
+
 Replaying a prior state must not mutate the original historical checkpoint.
 
 * Subgraphs
 
-A compiled graph may be invoked as a node. Support:
+A compiled graph may be invoked as a node.
+
+Support:
 
 - shared state keys mapped to parent channels;
 - isolated child state with explicit input/output mapping;
 - checkpoint namespaces identifying parent/child path;
 - configurable child persistence semantics.
 
+#+begin_src lisp
+(add-subgraph parent
+              :research
+              compiled-research-graph
+              :input-map '((:query . :query))
+              :output-map '((:findings . :research-findings))
+              :checkpoint-namespace "research")
+#+end_src
+
 Subgraph recursion and execution depth are bounded.
+
+Checkpoint identity includes namespace path so child =cp-3= cannot collide with parent =cp-3=.
 
 * Long-term store
 
-Separate long-term store from graph checkpointer. Store protocol uses namespace + key and supports get/put/delete/search/list operations, with batch variants where useful. An in-memory implementation is required.
+Separate long-term store from graph checkpointer.
+
+Checkpointer answers: “how do I resume/replay this execution?”
+
+Store answers: “what application/user data should nodes/tools retrieve later?”
+
+#+begin_src lisp
+(defclass long-term-store () ())
+
+(defgeneric store-get (store namespace key))
+(defgeneric store-put (store namespace key value &key metadata))
+(defgeneric store-delete (store namespace key))
+(defgeneric store-search (store namespace query &key limit filter))
+#+end_src
 
 Runtime context exposes the store to tools/nodes. Long-term memory is application/user data, not magically injected into prompts; agent middleware/tools choose how to retrieve/use it.
 
 * Event streaming
 
-Every graph run exposes typed events. Modes/projections should cover:
+Every graph run exposes typed events over Design 001 bounded event channels.
+
+Modes/projections should cover:
 
 - graph output values/state deltas;
 - task/node start/end/error;
@@ -148,11 +536,36 @@ Every graph run exposes typed events. Modes/projections should cover:
 - custom node events;
 - debug/all-events mode.
 
-Event order is defined per task and superstep; parallel task interleaving across tasks is allowed but each event carries task/node/superstep identity.
+Event metadata includes at minimum:
+
+#+begin_src lisp
+'((:thread-id . "chat-42")
+  (:checkpoint-id . "cp-18")
+  (:superstep . 6)
+  (:task-id . "step-6/tools/call-1")
+  (:node . :tools)
+  (:sequence . 4))
+#+end_src
+
+Event order is defined per task and superstep. Parallel task interleaving across tasks is allowed, but per-task sequence is monotonic.
+
+The scheduler must not block indefinitely because an observability-only consumer is slow. Semantic stream channels use backpressure; debug projections may use explicitly lossy/bounded policy if selected by the caller.
 
 * Tools
 
-Tool definition contains name, description, JSON Schema input, optional output schema, callable and metadata/policy. Tool execution:
+Tool definition contains name, description, JSON Schema input, optional output schema, callable and metadata/policy.
+
+#+begin_src lisp
+(defclass tool ()
+  ((name :initarg :name :reader tool-name)
+   (description :initarg :description :reader tool-description)
+   (input-schema :initarg :input-schema :reader tool-input-schema)
+   (output-schema :initarg :output-schema :initform nil :reader tool-output-schema)
+   (callable :initarg :callable :reader tool-callable)
+   (metadata :initarg :metadata :initform nil :reader tool-metadata)))
+#+end_src
+
+Tool execution:
 
 - validates arguments before call;
 - preserves call id;
@@ -162,19 +575,91 @@ Tool definition contains name, description, JSON Schema input, optional output s
 - returns typed tool result/error content;
 - never lets model-originated data select arbitrary Lisp functions outside the registry.
 
+** Tool registry lookup
+
+#+begin_src lisp
+(defclass tool-registry ()
+  ((tools :initarg :tools :reader registry-tools)))
+
+(defgeneric find-tool (registry name))
+
+(defun execute-tool-call (registry call context)
+  (let ((tool (or (find-tool registry (tool-call-name call))
+                  (error 'unknown-tool :name (tool-call-name call)))))
+    (validate-tool-call tool call)
+    (invoke-tool tool call context)))
+#+end_src
+
+Registry names are application-controlled. Model text cannot intern/funcall arbitrary symbols.
+
 * High-level agent
 
-=make-agent= is convenience built on the graph runtime, not a separate hidden loop. Canonical graph shape:
+=make-agent= is convenience built on the graph runtime, not a separate hidden loop.
 
-1. model node builds prompt/messages from state/context and invokes selected model;
+Canonical graph:
+
+#+begin_src text
+         +------------------------------+
+         |                              |
+         v                              |
+      MODEL ---- no tool calls ------> FINISH
+         |
+         | tool calls
+         v
+       TOOLS
+         |
+         +---- append correlated results+
+#+end_src
+
+Detailed behavior:
+
+1. model node builds messages from state/context and invokes selected model;
 2. if no tool calls, route to finish;
-3. if tool calls, fan out or run tool node(s) according to policy;
+3. if tool calls, emit =send= tasks or tool node batch according to policy;
 4. append correlated tool results through message reducer;
 5. route back to model;
 6. enforce iteration/model/tool/cost/token/deadline budgets;
 7. structured-output finalizer/validator where configured.
 
-Middleware may alter prompt/model selection/tool policy, but graph state/checkpoint semantics remain visible.
+Representative constructor:
+
+#+begin_src lisp
+(let ((agent
+        (make-agent
+         :model client
+         :tools registry
+         :checkpointer checkpointer
+         :store memory-store
+         :limits (make-agent-limits
+                  :max-supersteps 32
+                  :max-model-calls 16
+                  :max-tool-calls 64
+                  :max-parallel-tools 8))))
+  (invoke-agent agent "research Common Lisp HTTP clients"
+                :thread-id "research-7"))
+#+end_src
+
+The returned agent object exposes/contains its compiled graph so advanced callers can inspect or customize it rather than being trapped behind an opaque loop.
+
+* Message reducer
+
+The message channel needs stronger semantics than naive append because tool calls/results correlate by id.
+
+Rules:
+
+- ordinary new messages append;
+- a message update with the same stable message id may replace/merge according to explicit reducer rules;
+- tool-result messages preserve call id;
+- duplicate tool results for the same call id are detected rather than appended silently;
+- replay does not create duplicate messages if a pending write is reused.
+
+#+begin_src lisp
+(defclass message-history-reducer (reducer) ())
+
+(defmethod reduce-contributions ((reducer message-history-reducer)
+                                 old-value contributions context)
+  ...)
+#+end_src
 
 * Runtime limits
 
@@ -183,26 +668,75 @@ Configurable hard limits:
 - recursion/supersteps;
 - model calls;
 - tool calls and parallel tools;
-- spawned dynamic tasks;
+- spawned dynamic tasks per step/run;
 - event buffer sizes;
 - elapsed deadline;
 - token/cost budget where usage/pricing is available;
-- checkpoint/state serialized size.
+- checkpoint/state serialized size;
+- maximum message/history count where configured;
+- maximum pending writes per superstep.
+
+Representative limits object:
+
+#+begin_src lisp
+(defstruct graph-limits
+  (max-supersteps 100)
+  (max-parallel-tasks 32)
+  (max-spawned-tasks 10000)
+  (max-state-bytes (* 16 1024 1024))
+  (max-pending-writes 10000))
+#+end_src
+
+Constructors assert positive, bounded values. No “0 means unlimited” ambiguity; unlimited is explicit and should be unavailable in production defaults for dangerous dimensions.
 
 Limit exhaustion produces typed terminal conditions/events and a final checkpoint where safe.
 
 * Determinism boundary
 
-External model/tool calls are inherently nondeterministic, but graph mechanics are deterministic given task results. Reducer order, checkpoint lineage, task ids and routing behavior must not depend on hash iteration/thread scheduling.
+External model/tool calls are inherently nondeterministic, but graph mechanics are deterministic given task results.
+
+The following must never depend on scheduling/hash order:
+
+- reducer contribution order;
+- task ids;
+- checkpoint lineage;
+- static/conditional routing evaluation order;
+- send ordinal assignment;
+- pending-write reuse rules;
+- state serialization key order where hashes/digests are used.
+
+* Failure and recovery semantics
+
+** Node failure before pending write
+
+Task is failed; resume/retry executes it again.
+
+** Node success + pending write persisted + sibling failure
+
+Successful task may be reused on resume. Failed/missing siblings execute again.
+
+** Crash after all pending writes but before checkpoint commit
+
+Recovery reconstructs the superstep from valid pending writes and performs deterministic reduction/commit.
+
+** Crash after checkpoint commit but before response delivery
+
+The committed checkpoint is authoritative. Caller may query/load by thread id and avoid rerunning the committed superstep.
+
+** Checkpoint corruption/version mismatch
+
+Fail typed and do not guess. Repair/migration is an explicit application/admin action.
 
 * Tests
 
 Required deterministic tests include:
 
 - reducers and conflicting parallel writes;
+- deterministic contribution ordering across randomized completion schedules;
 - conditional routes, =send= and =command=;
 - bounded parallel supersteps;
 - task failure with pending-write recovery;
+- crash window between pending writes and checkpoint commit;
 - interrupt/resume and side-effect-safe examples;
 - subgraph state mapping;
 - checkpoint history/replay/fork;
@@ -210,7 +744,88 @@ Required deterministic tests include:
 - streaming event ordering/identity;
 - agent single tool, parallel tools, tool errors, structured output;
 - recursion/budget/deadline cancellation;
-- checkpoint corruption/version mismatch behavior.
+- checkpoint corruption/version mismatch behavior;
+- duplicate tool result/message reducer behavior;
+- concurrent attempt to advance one thread head.
+
+** Deterministic reducer test
+
+#+begin_src lisp
+(test reducer-result-independent-of-task-completion-order
+  (loop repeat 100
+        for completion-order = (shuffle-copy '(a b c d))
+        for state = (run-superstep-fixture :completion-order completion-order)
+        do (is (equal '(a b c d) (state-ref state :ordered-results)))))
+#+end_src
+
+** Pending-write recovery test
+
+#+begin_src lisp
+(test completed-sibling-is-not-reexecuted-after-resume
+  (let ((fixture (make-two-task-fixture :task-b-fails-once t)))
+    (signals graph-task-error (run-graph fixture))
+    (resume-graph fixture)
+    (is (= 1 (execution-count fixture :task-a)))
+    (is (= 2 (execution-count fixture :task-b)))))
+#+end_src
+
+** Checkpoint conflict test
+
+#+begin_src lisp
+(test thread-head-compare-and-swap
+  (let ((head (load-latest-checkpoint cp "thread")))
+    (commit-checkpoint cp next-a (checkpoint-id head))
+    (signals checkpoint-conflict
+      (commit-checkpoint cp next-b (checkpoint-id head)))))
+#+end_src
+
+* Implementation slices
+
+1. state schema/channels/reducers + deterministic contribution ordering;
+2. graph builder/compiler + node/edge/outcome normalization;
+3. task ids + bounded scheduler + superstep barrier;
+4. in-memory checkpointer + atomic checkpoint commit;
+5. pending writes + recovery tests;
+6. event streaming + runtime limits/cancellation;
+7. interrupt/resume + history/replay/fork;
+8. subgraphs + namespace semantics;
+9. long-term store protocol/in-memory backend;
+10. tool registry/executor/message reducer;
+11. =make-agent= graph constructor + provider/tool integration;
+12. persistence codec/version hooks + full parity/conformance tests.
+
+Do not implement the high-level agent before slices 1–7 are semantically stable.
+
+* Rejected alternatives
+
+** Shared mutable state handed to nodes
+
+Rejected because parallel nodes could race and checkpoint/replay semantics become undefined.
+
+** Commit each task independently to graph state
+
+Rejected because it destroys superstep/barrier semantics and makes partial parallel results visible unpredictably.
+
+** Random task ids only
+
+Rejected because pending-write recovery and deterministic replay need stable task identity.
+
+** Checkpointer doubles as long-term memory store
+
+Rejected because execution lineage and application memory have different lifecycle/query semantics.
+
+** Recursive model/tool loop outside graph runtime
+
+Rejected because interrupts, streaming, persistence, time travel and budgets would need a second incompatible runtime.
+
+* Open design questions for maintainer approval
+
+1. Default replace-channel conflict policy. Recommendation: multiple parallel writes signal unless the channel explicitly declares deterministic last-writer ordering.
+2. Checkpoint codec format for the first persistent backend. Keep protocol abstract now; do not freeze persistence to printed Lisp objects.
+3. Whether graph task ids are human-readable deterministic strings or structured ids rendered to strings. Recommendation: structured internally, stable rendered form for diagnostics.
+4. Whether an interrupt is a node outcome or a special condition caught by the scheduler. Public semantics can be identical; recommendation is explicit outcome/helper to avoid using conditions for normal control flow.
+5. Whether one thread may have concurrent writers. Recommendation: supported only through expected-parent compare-and-swap, with conflict surfaced rather than serialized invisibly.
+6. Whether pending writes are mandatory in every checkpointer backend. Recommendation: protocol capability flag; in-memory/reference supports them, backends lacking them rerun successful siblings after failure but cannot claim full fault-tolerance parity.
 
 * Related research/design
 
@@ -222,6 +837,7 @@ Required deterministic tests include:
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
+| 2026-08-12 | Expanded concrete graph APIs, deterministic task/reducer semantics, pending-write recovery, checkpoint CAS/versioning, interrupts and agent construction. | GPT-5.6 Sol | Design review pass |
 | 2026-08-12 | Created graph/state/checkpoint/interrupt/time-travel and high-level agent design. | GPT-5.6 Sol | Current LangGraph/LangChain research |
 
 * Footnotes and Glossary
@@ -229,3 +845,5 @@ Required deterministic tests include:
 - *Superstep*: barrier-delimited set of graph tasks that read committed state and commit combined writes together.
 - *Reducer*: function/policy combining multiple state updates for a channel.
 - *Pending write*: successful task contribution persisted before its superstep fully commits.
+- *Thread head*: latest committed checkpoint in one graph execution lineage.
+- *Canonical task order*: deterministic ordering independent of actual completion schedule.
