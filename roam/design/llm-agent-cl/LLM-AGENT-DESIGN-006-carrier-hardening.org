@@ -1,0 +1,351 @@
+:PROPERTIES:
+:ID: llm-agent-design-006
+:END:
+#+title: Carrier maintained-fork hardening design
+#+description: Implementation design for turning lost-rob0t/carrier into the production asynchronous HTTP client required by llm-agent-cl.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:design:carrier:http:tls:cancellation:pooling:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| Carrier public API evolution | Maintainer | PENDING | Review compatibility/new handle API | This design |
+| TLS security design | Maintainer | PENDING | Review fail-closed verification plan | Research 007 |
+| Pooling/cancellation/deadline design | Maintainer | PENDING | Review lifecycle state machine | This design |
+| Carrier implementation authorization | Maintainer | NOT STARTED | Explicit approval of this design | None |
+
+* Target repository and boundary
+
+Implementation target after approval: =https://github.com/lost-rob0t/carrier=.
+
+At design time the fork's =master= tree is still the upstream Carrier =95ea9edba80f67598bfde550a170a2f787970223= tree. No code changes are authorized by this document's publication.
+
+Carrier remains a standalone generic asynchronous HTTP client. Do not introduce llm-agent-cl, OpenRouter, MCP, StarIntel or agent concepts into Carrier.
+
+* Compatibility goal
+
+Preserve the existing =carrier:request= convenience API where practical so existing callers do not need a flag-day rewrite. Implement it through the new client/request core so all callers inherit secure TLS and lifecycle fixes.
+
+Security-breaking historical behavior is not preserved. In particular, successful insecure TLS connections cannot remain the default for compatibility.
+
+* Proposed new public objects/API
+
+**client** owns reusable resources and policy:
+
+- event-loop integration;
+- TLS context/trust policy;
+- bounded connection pools;
+- proxy policy;
+- default timeouts/deadline limits;
+- redirect policy;
+- max response/header limits;
+- shutdown state.
+
+**request-handle** owns one in-flight operation:
+
+- request id;
+- client reference;
+- socket/connection lease;
+- Blackbird promise/result compatibility handle;
+- terminal state/condition;
+- deadline/timers;
+- response status/headers;
+- byte counters;
+- redirect history;
+- cancellation flag/reason.
+
+Proposed operations (names reviewable):
+
+- =make-client=;
+- =submit-request= -> request-handle plus/future;
+- =request-handle-promise=;
+- =cancel-request=;
+- =request-state=;
+- =close-client=;
+- legacy =request= convenience implemented using a default/temporary client policy.
+
+Do not require callers to reach into =cl-async= socket internals.
+
+* Request lifecycle state machine
+
+States:
+
+- =:new=;
+- =:resolving/connecting=;
+- =:tls-handshake= where applicable;
+- =:request-sending=;
+- =:response-headers=;
+- =:streaming=;
+- terminal =:completed=, =:failed=, =:cancelled=.
+
+Redirects create a controlled next-attempt transition/history while preserving one logical request handle. Exactly one terminal transition is allowed. Late libuv/parser/timer callbacks check terminal state and become no-ops except diagnostics/resource release.
+
+* TLS verification
+
+Production client TLS must verify **both chain and hostname** before application response bytes are exposed.
+
+Required handshake behavior:
+
+1. create/reuse a client TLS context configured with system or explicitly configured CA trust;
+2. enable peer verification (=SSL_VERIFY_PEER= or equivalent);
+3. set SNI to requested DNS host;
+4. verify OpenSSL chain result after handshake;
+5. verify hostname against leaf certificate using =X509_check_host= or equivalent supported API;
+6. fail request before HTTP parsing if any validation fails;
+7. include safe typed TLS failure metadata without certificate secrets.
+
+IP literal verification should use the appropriate OpenSSL IP verification path rather than treating it as a DNS hostname.
+
+If a supported OpenSSL/cl-async-ssl combination cannot perform hostname validation safely, startup/client creation should signal unsupported TLS capability rather than silently using =VERIFY_NONE=.
+
+* TLS implementation boundary
+
+Preferred implementation:
+
+- add safe verification/context hooks to Carrier's own TLS adapter layer while using =cl-async-ssl= for nonblocking BIO/socket plumbing;
+- isolate any additional CFFI calls in =carrier.tls= or equivalent internal module;
+- detect OpenSSL API availability at load/client initialization;
+- add compatibility code/tests for the supported OpenSSL versions.
+
+Do not make llm-agent-cl responsible for private =cl-async-ssl= symbols. If fixing =cl-async-ssl= upstream/fork is clearly cleaner, that change requires its own reviewed dependency action, but Carrier still exposes the stable public security contract.
+
+* Trust configuration
+
+Secure defaults:
+
+- use system default trust roots;
+- optional explicit CA file/directory/trust configuration;
+- certificate verification enabled by default and not disabled by a surprising convenience keyword;
+- any deliberate insecure mode, if retained for localhost test fixtures, must be loudly named, opt-in, non-default and documented as unsafe. llm-agent-cl production adapter will not expose it.
+
+* Connection pooling
+
+Client owns per-origin pools keyed by at least:
+
+- scheme;
+- host;
+- port;
+- proxy identity/policy;
+- TLS trust/client-cert policy where relevant.
+
+HTTP/1.1 first implementation:
+
+- reuse only connections known healthy and response-complete;
+- one active request per connection; no HTTP pipelining initially;
+- obey =Connection: close= and protocol close;
+- bounded max connections per origin and globally;
+- idle timeout and max idle count;
+- validate no unread response bytes before returning to pool;
+- close all idle/in-use leases deterministically on client shutdown/cancellation policy.
+
+A pool wait queue must be bounded/cancellable/deadline-aware.
+
+* TLS context reuse
+
+Client owns reusable TLS context(s) keyed by trust/cipher/version policy. Context creation/loading verify paths happens once per policy instead of every request. Individual SSL objects remain per connection.
+
+Changing trust policy creates a distinct/new context; never mutate one shared context under active connections in unsafe ways.
+
+* HTTP request serialization
+
+Replace text-round-trip request construction with octet-correct serialization.
+
+- method/token and header names/values validated against injection/CRLF rules;
+- request target/path/query encoded deliberately;
+- headers serialized as protocol bytes;
+- body may be octet vector, string encoded using explicit encoding/content-type policy, or streaming producer;
+- Content-Length computed for known finite body unless caller explicitly supplies compatible value;
+- streaming body uses chunked transfer encoding for HTTP/1.1 when length unknown;
+- never format arbitrary octets through Lisp strings.
+
+Host header includes port where required and correctly handles IPv6 literals.
+
+* Streaming upload interface
+
+Producer abstraction supplies bounded octet chunks asynchronously/on demand. It must support:
+
+- backpressure from socket writability;
+- EOF;
+- producer error;
+- cancellation;
+- known/unknown total length;
+- maximum request body policy.
+
+Do not buffer an unbounded producer just to compute length.
+
+* Response parser limits
+
+Continue using =fast-http= initially, wrapped with project limits:
+
+- maximum status/header bytes;
+- maximum single header count/value size where feasible;
+- optional maximum buffered body when =return-body=;
+- streaming callback receives bounded valid slice;
+- parser exceptions normalized and close connection;
+- EOF rules distinguish valid close-delimited completion from truncation.
+
+* Redirect policy
+
+Support explicit 301/302/303/307/308 semantics.
+
+Rules:
+
+- resolve relative Location against current URL;
+- track visited URLs/hop count and fail on configured max/loop;
+- 307/308 preserve method/body;
+- 303 becomes GET except HEAD semantics as appropriate;
+- 301/302 compatibility behavior for non-GET is an explicit policy rather than accidental recursion;
+- cross-origin redirect strips =Authorization=, =Proxy-Authorization= and caller-designated sensitive headers by default;
+- cookies follow cookie-jar origin/security rules;
+- HTTPS -> HTTP downgrade is rejected by secure default unless explicitly allowed;
+- replaying a streaming/non-rewindable request body across redirect is rejected unless producer is declared rewindable.
+
+* Cancellation
+
+=cancel-request= is idempotent.
+
+When cancellation wins:
+
+- cancel timers/waits;
+- remove request from pool wait queue or close/retire active connection as necessary;
+- stop upload producer;
+- reject/complete promise once with =request-cancelled= condition;
+- suppress subsequent response callbacks;
+- release all request-owned resources exactly once.
+
+Cancellation during DNS/connect/TLS/send/headers/body/pool-wait gets dedicated regression tests.
+
+* Timeout and deadline model
+
+Client/request supports:
+
+- connect timeout;
+- TLS handshake timeout (may be part of connect but separately observable);
+- read/idle timeout reset by inbound progress;
+- write/idle timeout reset by outbound progress;
+- absolute request deadline.
+
+Absolute deadline caps every phase. The earliest timer wins; terminal-state guard prevents multiple rejection callbacks.
+
+* Proxy support
+
+Before claiming generic production readiness, either implement explicit HTTP CONNECT/HTTP proxy policy or expose a typed =proxy-unsupported= condition. Never accept a proxy option and silently ignore it.
+
+Proxy authentication credentials follow the same redaction and redirect/origin protection rules.
+
+* Cookie behavior
+
+Retain =cl-cookie= compatibility but make cookie jar client/request scoped rather than hidden global state. Secure/SameSite/domain/path semantics rely on the cookie library; add regression tests for redirect/domain leakage relevant to HTTP client behavior.
+
+* Observability
+
+Optional callbacks/events include request start, DNS/connect/TLS timings where observable, headers, bytes sent/received, redirect, reuse/new connection, cancellation, completion/failure.
+
+Never log Authorization/Cookie/Proxy-Authorization or TLS secrets. Header logging uses redaction policy.
+
+* Error conditions
+
+Carrier should expose a coherent condition hierarchy for:
+
+- DNS/connect;
+- TLS verification/handshake;
+- timeout/deadline;
+- malformed request;
+- protocol/parser;
+- response limits;
+- redirect policy;
+- cancelled;
+- pool/client closed;
+- producer/upload error.
+
+Keep compatibility with existing condition handling where reasonable by subclassing/aliasing rather than deleting old conditions without migration notes.
+
+* CI and deterministic fixture suite
+
+Add GitHub Actions for SBCL reference environment plus system packages required by libuv/OpenSSL.
+
+Local fixture servers/tests must cover:
+
+**TLS**
+- trusted local CA + correct hostname succeeds;
+- self-signed/untrusted fails;
+- expired/not-yet-valid fails;
+- correct CA but wrong hostname fails;
+- alternate hostname/SAN cases;
+- reused context still verifies per-host connection correctly.
+
+**Lifecycle**
+- cancel in each state;
+- timeout/deadline in each relevant state;
+- repeated cancellation/completion races (thousands of deterministic/repetition iterations as practical);
+- client shutdown with idle and active requests;
+- no double promise resolution/rejection.
+
+**Pooling**
+- same-origin reuse observed;
+- =Connection: close= not reused;
+- origin/TLS/proxy policy isolation;
+- pool limit wait/cancel/deadline;
+- idle expiration.
+
+**HTTP**
+- binary body round trip;
+- chunked streaming upload;
+- incremental response chunks;
+- redirects/method handling/cross-origin auth stripping/downgrade policy;
+- malformed/truncated response;
+- response/header limits;
+- cookies.
+
+Add leak/resource tests observing file descriptors/connections where feasible.
+
+* Release plan
+
+After implementation/design approval and green release gates:
+
+1. document fork ownership/security changes;
+2. update ASDF version; proposed first hardened release =0.2.0=;
+3. changelog with compatibility changes;
+4. tag release;
+5. llm-agent-cl pins/tests that release or exact commit until registry distribution is updated;
+6. upstream useful generic fixes when practical, without making upstream acceptance a release dependency.
+
+No release may claim TLS-safe production use until all verification fixtures pass.
+
+* Implementation slicing after approval
+
+Recommended Carrier PR sequence:
+
+1. test/CI foundation + request state guard;
+2. secure TLS context and hostname verification;
+3. request handle + cancellation/deadline;
+4. octet-safe request serialization + streaming upload;
+5. connection/TLS-context pooling;
+6. redirect security + proxy explicitness;
+7. compatibility docs, stress/leak suite and =0.2.0= release.
+
+Each slice stays independently testable. llm-agent-cl async integration waits for the required secure/lifecycle slices rather than tracking half-hardened master as “production.”
+
+* Historical contingency
+
+The libcurl-multi alternative remains documented in research 007 but is not authorized by this design. Failure or difficulty in Carrier implementation does not automatically authorize switching stacks; return to design review if a fundamental blocker is discovered.
+
+* Related research/design
+
+- [[id:llm-agent-research-003][Transport research]]
+- [[id:llm-agent-research-007][Carrier maintained-fork research]]
+- [[id:llm-agent-design-001][Core contracts]]
+- [[id:llm-agent-design-002][OpenRouter/transport integration]]
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Created maintained-fork Carrier production hardening design with TLS, cancellation, pooling, serialization, redirect and release gates. | GPT-5.6 Sol | Research 003/007 and maintainer fork decision |
+
+* Footnotes and Glossary
+
+- *Connection lease*: temporary ownership of a pooled connection by one request.
+- *Rewindable producer*: streaming body source capable of restarting identically after an allowed redirect/retry.
+- *Fail closed*: abort when verification/security cannot be established instead of falling back to insecure operation.

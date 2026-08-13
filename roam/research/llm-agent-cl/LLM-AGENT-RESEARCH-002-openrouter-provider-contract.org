@@ -2,48 +2,101 @@
 :ID: llm-agent-research-002
 :END:
 #+title: OpenRouter provider contract research
-#+description: Current OpenRouter API behavior required for the first llm-agent-cl provider adapter.
+#+description: Current OpenRouter chat, structured-output, model-capability, embeddings, authentication and streaming behavior for the first llm-agent-cl provider.
 #+status: DRAFT
-#+filetags: :llm-agent-cl:research:openrouter:provider:
+#+filetags: :llm-agent-cl:research:openrouter:provider:embeddings:structured-output:
 
 * Approval Table
 
 | Approval area | Required authority | State | Evidence required | Evidence reference |
 |---------------+--------------------+-------+-------------------+--------------------|
 | Provider research | Maintainer | PENDING | Review against OpenRouter docs | Sources below |
-| First-provider selection | Maintainer | PENDING | Explicit approval | User request |
-| Implementation authorization | Maintainer | NOT STARTED | Approved design | None |
+| First-provider selection | Maintainer | APPROVED | Explicit maintainer request | OpenRouter selected from project start |
+| Flexible quick-test configuration | Maintainer | APPROVED | Explicit maintainer review | 2026-08-12 review |
+| Implementation authorization | Maintainer | NOT STARTED | Approved designs | Design set pending review |
 
 * Verified facts
 
-OpenRouter exposes an OpenAI-compatible HTTP API and standardizes tool calling across models/providers. The stable chat-completions path supports =messages=, model selection, tools, and =stream: true=. Streaming uses Server-Sent Events (SSE). OpenRouter can emit SSE comment lines as keepalive/processing signals; consumers must ignore valid SSE comments rather than parse every line as JSON.
+OpenRouter exposes an OpenAI-compatible HTTP API and standardizes tool calling across models/providers. The stable chat-completions path supports =messages=, model selection, tools and =stream: true=. Streaming uses Server-Sent Events (SSE). OpenRouter can emit SSE comment lines as keepalive/processing signals; consumers must ignore valid SSE comments rather than parse every line as JSON.
 
-Streaming tool calls arrive incrementally and therefore require assembly by tool-call index/ID before arguments are parsed as complete JSON. A final chunk can include usage metadata. Errors that occur after HTTP 200 may be delivered inside the stream as a terminal event with an error payload and =finish_reason: error=.
+Streaming tool calls arrive incrementally and require assembly by tool-call index/ID before arguments are parsed as complete JSON. A final chunk can include usage metadata. Errors that occur after HTTP 200 may be delivered inside the stream as a terminal error payload. The generation ID exposed in response metadata/headers should be preserved as provider-native metadata.
 
-OpenRouter documents stream cancellation by closing/aborting the connection; immediate upstream cancellation support varies by provider. The generation ID is also exposed in the =X-Generation-Id= response header and should be preserved as provider metadata.
+OpenRouter documents stream cancellation by closing/aborting the connection; immediate upstream cancellation support varies by provider. This reinforces the requirement for a real cancellable async transport handle.
 
-OpenRouter also exposes an OpenAI-compatible Responses API, but its current documentation labels it beta and stateless. Therefore it is not a sound sole production foundation for the first adapter. The initial adapter should research chat-completions as the compatibility baseline while keeping endpoint families behind provider capabilities.
+The Responses API remains documented as beta. It is useful as an optional endpoint family but should not be the sole production foundation for the first adapter. Chat Completions remains the baseline provider contract; Responses support should be capability/feature-flagged until its stability contract changes.
+
+* Authentication and configuration decision
+
+The earlier wording “authentication from caller-supplied secret/config only” was too restrictive for the maintainer's desired REPL/development experience.
+
+The provider design must support a deterministic resolution chain:
+
+1. explicit per-call credential/config override;
+2. explicit provider/client configuration object;
+3. dynamically scoped defaults (for tests/REPL blocks);
+4. intentionally configured process-wide convenience defaults;
+5. provider-standard environment fallback such as =OPENROUTER_API_KEY=;
+6. otherwise signal a typed missing-credential condition.
+
+There must never be a library-shipped hard-coded credential. Convenience defaults are allowed, but resolved secrets must be redacted from object printers, logs, conditions, traces and serialized checkpoints.
+
+This is similar in spirit to current LangChain quickstarts, which commonly support environment-variable provider keys while also allowing explicit model/client configuration.
+
+* Structured outputs: field-level gap closed
+
+OpenRouter's current Structured Outputs documentation specifies provider-native JSON Schema enforcement through =response_format=:
+
+#+begin_src json
+{
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "result",
+      "strict": true,
+      "schema": {"type": "object"}
+    }
+  }
+}
+#+end_src
+
+Current guidance recommends =strict: true=. Structured outputs are model-dependent. The Models API exposes each model's =supported_parameters=, including values such as =structured_outputs= and =response_format=. Provider routing can use =require_parameters: true= so a request requiring structured output is not silently sent to an endpoint lacking support.
+
+Structured outputs can also be streamed; the stream contains partial JSON that becomes schema-valid when complete. llm-agent-cl therefore needs separate states for incremental structured text and final schema-validated value.
+
+For tools, provider/model strictness and beta provider headers remain provider-native extensions rather than canonical core fields. Unknown routing/provider features must survive through the provider extension map.
+
+* Model discovery and capability profiles
+
+OpenRouter's Models API can filter by =supported_parameters= and output modality. Model records expose architecture/input/output modalities, context length, pricing, supported parameters and provider metadata. llm-agent-cl should normalize a conservative capability profile while preserving the full provider-native record.
+
+The cache must have explicit staleness/refresh controls. Capability absence is not proof of permanent lack of support; stale caches must be observable and refreshable.
+
+* Embeddings
+
+OpenRouter now exposes a first-class embeddings API at =POST /api/v1/embeddings= and an embeddings model listing endpoint. Requests support a single input or batch input and model selection, with optional dimensions, encoding format, input type and provider routing. Responses include indexed embedding vectors plus model and usage metadata.
+
+OpenRouter's embeddings documentation states that embeddings are returned as complete responses rather than streamed. This provider therefore satisfies the first remote embedding-model implementation required by the LangChain parity milestone.
+
+The OpenRouter provider adapter should implement both chat-model and embedding-model protocols without making the core assume all providers expose both through the same endpoint family.
 
 * Required provider adapter behaviors
 
-- Authentication from caller-supplied secret/config only; never global hard-coded state.
-- Model discovery/capability caching with explicit staleness policy.
-- Canonical request translation from provider-neutral messages/content/tools.
-- Provider extension map for OpenRouter-only routing and metadata fields.
+- Deterministic credential/config resolution as defined above.
+- Model and embedding-model discovery/capability caching with explicit staleness policy.
+- Canonical request translation from provider-neutral messages/content/tools/structured-output requests.
+- Provider extension map for OpenRouter routing and metadata fields.
 - Non-stream and stream response normalization.
-- Preservation of usage, finish reason, model/provider metadata, tool-call IDs, and generation identifiers.
-- Typed HTTP errors, provider errors, malformed responses, and mid-stream errors.
+- Embedding single/batch normalization.
+- Preservation of usage, finish reason, model/provider metadata, tool-call IDs and generation identifiers.
+- Typed HTTP errors, provider errors, malformed responses and mid-stream errors.
 - Cancellation and deadline propagation to the HTTP transport.
 - Explicit unsupported-capability errors rather than silent field dropping.
 - Retry classification that distinguishes safe pre-submit failures from ambiguous or partially streamed submissions.
+- Secret redaction in all printable/observable objects.
 
 * Tool loop requirements
 
-OpenRouter follows the common tool-call loop: append the assistant tool-call message to conversation history, execute each requested tool, append correlated tool results, then invoke the model again. The core agent layer, not the OpenRouter adapter, should own this loop.
-
-* Structured output gap
-
-A field-level conformance pass is still required for OpenRouter structured-output parameters and per-model capability discovery before implementation. This research intentionally does not invent those request fields from OpenAI memory.
+OpenRouter follows the common tool-call loop: append the assistant tool-call message to conversation history, execute each requested tool, append correlated tool results, then invoke the model again. The core agent/graph layer, not the OpenRouter adapter, owns this loop.
 
 * Sources
 
@@ -51,17 +104,25 @@ Retrieved 2026-08-12.
 
 - https://openrouter.ai/docs/quickstart
 - https://openrouter.ai/docs/guides/features/tool-calling
+- https://openrouter.ai/docs/guides/features/structured-outputs
 - https://openrouter.ai/docs/api/reference/streaming
 - https://openrouter.ai/docs/api/reference/responses/overview
-- https://openrouter.ai/docs/faq
+- https://openrouter.ai/docs/guides/overview/models
+- https://openrouter.ai/docs/api/api-reference/models/get-models
+- https://openrouter.ai/docs/api/reference/embeddings
+- https://openrouter.ai/docs/api/api-reference/embeddings/create-embeddings
+- https://openrouter.ai/docs/api/api-reference/embeddings/list-embeddings-models
+- https://docs.langchain.com/oss/python/langchain/quickstart
 
 * Changelog
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
-| 2026-08-12 | Created first-provider research with streaming/tool/error constraints. | GPT-5.6 Sol | OpenRouter official docs retrieved 2026-08-12 |
+| 2026-08-12 | Replaced explicit-only authentication constraint with deterministic explicit/scoped/global/environment convenience resolution; closed structured-output gap and added OpenRouter embeddings. | GPT-5.6 Sol | Maintainer direction plus current OpenRouter official docs |
+| 2026-08-12 | Created first-provider research with streaming/tool/error constraints. | GPT-5.6 Sol | OpenRouter official docs |
 
 * Footnotes and Glossary
 
 - *SSE*: Server-Sent Events, the event framing used by OpenRouter streaming.
 - *Ambiguous submission*: a request whose server-side execution status is unknown after a transport failure.
+- *Capability profile*: normalized provider/model features used for routing and validation, with provider-native metadata retained alongside it.

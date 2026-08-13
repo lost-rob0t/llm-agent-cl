@@ -1,0 +1,272 @@
+:PROPERTIES:
+:ID: llm-agent-design-001
+:END:
+#+title: Core library architecture and public contracts
+#+description: Proposed package boundaries, canonical values, execution primitives, configuration, conditions and dependency isolation for llm-agent-cl.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:design:core:api:configuration:concurrency:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| Public package/API shape | Maintainer | PENDING | Review this design | None |
+| Configuration precedence | Maintainer | PENDING | Review explicit/default behavior | Research 002/006 |
+| Concurrency/dependency choices | Maintainer | PENDING | Review research 009 | None |
+| Implementation authorization | Maintainer | NOT STARTED | Explicit approval | None |
+
+* Goal
+
+Define a small, dependency-isolated Common Lisp foundation on which providers, graph execution, agents, retrieval and MCP can be built without allowing one transport/provider/framework dependency to dictate the public API.
+
+* ASDF and package family
+
+Proposed first-party systems:
+
+- =llm-agent/core= — canonical values, conditions, generic protocols and utilities;
+- =llm-agent/config= — explicit/scoped/process default resolution and secret redaction;
+- =llm-agent/concurrency= — cancellation, deadlines, futures/results, executors and bounded event channels;
+- =llm-agent/transport= — transport request/response protocols only;
+- =llm-agent/provider= — model/embedding provider protocols and capability profiles;
+- =llm-agent/tools= — tool schema/registry/execution contracts;
+- =llm-agent/structured= — JSON Schema validation and structured-output result contracts;
+- =llm-agent/runtime= — invocation context and middleware/interceptor contracts;
+- =llm-agent= — umbrella convenience system after stable components exist.
+
+Provider, graph, MCP and retrieval implementations are separate systems described by sibling designs.
+
+* Canonical value model
+
+Use CLOS classes/structures with constructors/accessors and documented immutability expectations rather than exposing dependency objects directly.
+
+**Messages**
+
+A canonical message contains:
+
+- role/type: system, developer where supported, user, assistant, tool, custom;
+- ordered content blocks;
+- optional name/id;
+- provider-native extension map;
+- response/tool metadata where relevant.
+
+**Content blocks**
+
+Minimum typed variants:
+
+- text;
+- image/image-url;
+- audio;
+- file/resource reference;
+- reasoning/thinking metadata where provider policy permits exposure;
+- tool call;
+- tool result;
+- structured JSON/value;
+- provider-native block.
+
+Unknown provider content is preserved rather than silently dropped.
+
+**Model result**
+
+Contains output messages/content, finish reason, usage, model/provider identity, generation/request identifiers, structured result where requested, and provider-native metadata.
+
+**Usage**
+
+Normalize prompt/input, completion/output and total token counts when available, plus optional cached/reasoning/provider-specific counters and monetary metadata. Unknown counts remain unknown rather than zero.
+
+**Model profile**
+
+Normalized capability flags/limits: context length, input/output modalities, tools, parallel tools, structured output, reasoning, embeddings, max output and provider-native capabilities with observed/fetched timestamp.
+
+**Tool call/result**
+
+Preserve stable call id, tool name, raw/validated arguments, result/error, content blocks and metadata.
+
+Canonical document/vector values are defined in Design 004 but use the same extension/provenance conventions.
+
+* Protocol style
+
+Public extensibility should use generic functions/protocol classes rather than implementation-specific conditionals. Protocols include model invocation, embeddings, transport execution, tool execution, schema validation, store operations and middleware.
+
+A protocol method may have sync and async entrypoints, but semantic result/error types are shared.
+
+* Configuration model
+
+Configuration resolution is deterministic and inspectable.
+
+For a setting such as provider key/model/base URL:
+
+1. operation keyword/explicit override;
+2. explicit client/provider config object;
+3. dynamically scoped defaults;
+4. intentionally configured process defaults;
+5. documented environment variable fallback;
+6. library default or typed missing-config condition.
+
+Expose conveniences such as:
+
+- =make-config= / =make-provider-config=;
+- =with-default-config= for dynamic scope;
+- =set-default-config= / =clear-default-config= for REPL testing;
+- =resolve-config= for debugging precedence without printing secrets.
+
+Process defaults are caller-owned convenience state. Conversation/checkpoint history never implicitly lives there.
+
+* Secret values
+
+Credentials use a secret wrapper/value policy whose printer displays redacted text. Conditions and event metadata must call redaction before rendering. Checkpoints/config serialization exclude secret material by default. A provider may resolve =OPENROUTER_API_KEY= at call/client construction time without storing it globally unless the caller intentionally asks to configure a default.
+
+* Runtime context
+
+Each invocation receives a context containing optional:
+
+- configuration;
+- cancellation token;
+- deadline;
+- executor;
+- long-term store;
+- checkpointer/thread identity where applicable;
+- middleware stack;
+- event writer/stream sink;
+- arbitrary typed caller context/dependencies.
+
+This is the bridge between explicit embeddability and convenient high-level APIs.
+
+* Cancellation and deadlines
+
+**Cancellation token**
+
+A token has atomic state, reason and callback registration. Cancelling is idempotent. Child tokens inherit parent cancellation. Transport, tool and graph tasks register cleanup/cancel hooks.
+
+**Deadline**
+
+Represent absolute monotonic expiration rather than repeatedly recomputing relative timeouts. Child operations receive the minimum of parent and operation-specific deadline.
+
+Timeout conditions distinguish connect, read/idle, tool, checkpoint and overall execution where possible.
+
+* Futures/results
+
+Expose a project-owned future/promise protocol:
+
+- await with optional timeout/cancellation;
+- resolved/rejected/cancelled state;
+- result/condition retrieval;
+- continuations/callback registration as a convenience;
+- exactly-once terminal transition.
+
+Initial worker-backed implementation may use lparallel internally; Carrier adaptation may bridge Blackbird promises. Neither dependency class appears in public signatures.
+
+* Bounded event channels
+
+Streaming provider and graph operations need bounded producer/consumer channels or equivalent event-source objects. Required behavior:
+
+- bounded queue capacity;
+- producer backpressure policy;
+- cancellation propagation;
+- terminal completion/error event exactly once;
+- iterator/callback consumption styles;
+- async wait integration.
+
+Provider SSE chunk boundaries never define public stream-event boundaries.
+
+* Middleware/interceptors
+
+Middleware can wrap/observe:
+
+- model calls;
+- tools;
+- graph node/task execution;
+- state transitions/checkpoints;
+- retrieval/embedding calls;
+- retries/fallback selection;
+- emitted events.
+
+Ordering is deterministic. Middleware receives a typed operation context and =next= continuation. It may transform request/result only within the declared protocol. Secret redaction applies before observability middleware.
+
+* Condition hierarchy
+
+Proposed root =llm-agent-error= with typed families:
+
+- =configuration-error= / =missing-credential=;
+- =unsupported-capability=;
+- =transport-error= -> DNS/connect/TLS/timeout/protocol/status/cancelled;
+- =provider-error= -> malformed/provider-declared/rate-limit;
+- =stream-error= / =partial-stream-error=;
+- =schema-error= / =structured-output-error=;
+- =tool-error=;
+- =graph-error= / reducer/checkpoint/interrupt variants;
+- =retrieval-error=;
+- =mcp-error=.
+
+Conditions include machine-readable fields but safe reporters.
+
+* JSON and schema boundary
+
+Use =com.inuoe.jzon= initially for JSON parse/write. Use =cl-jschema= through a project-owned schema-validator protocol. Tool/provider code should pass self-contained schemas. Schema validation failures carry JSON pointer/path information where available.
+
+* Executor model
+
+Use an explicit executor object, initially backed by lparallel, for bounded CPU/blocking/concurrent tasks. Never assume a package-global lparallel kernel. Runtime/client constructors may pick a process default executor for convenience, but the resolved executor is explicit in context.
+
+Carrier event-loop callbacks should not run arbitrary user tools or CPU-heavy middleware inline; dispatch them appropriately.
+
+* Public API ergonomics
+
+Support both explicit production use and concise REPL use. Representative intended shape (names are design-level, not frozen):
+
+#+begin_src lisp
+(llm:configure-default :provider :openrouter
+                       :model "openai/gpt-5"
+                       :api-key (uiop:getenv "OPENROUTER_API_KEY"))
+
+(llm:invoke "hello")
+
+(llm:with-config ((:provider :openrouter) (:model "..."))
+  (llm:stream "hello"))
+
+(let ((client (llm:make-client :provider :openrouter :api-key key)))
+  (llm:invoke client messages))
+#+end_src
+
+Exact symbols may be refined before 1.0, but all three usage modes must remain possible.
+
+* Testing and compatibility
+
+Core tests must cover:
+
+- canonical-value round trips;
+- extension preservation;
+- config precedence/reset/dynamic nesting;
+- secret-redaction property tests;
+- future cancellation/completion races;
+- deadline inheritance;
+- bounded-channel backpressure and cancellation;
+- middleware ordering/failure behavior;
+- condition field/report stability.
+
+Initial reference runtime is SBCL. Public semantic versioning begins immediately; pre-1.0 breaking changes require changelog/migration notes.
+
+* Non-goals
+
+- no daemon/control plane;
+- no mandatory database;
+- no StarIntel schema or actor runtime;
+- no dependency classes as public API;
+- no hidden process-global conversation history.
+
+* Related research
+
+- [[id:llm-agent-research-001][Parity scope]]
+- [[id:llm-agent-research-006][Library boundary/configuration]]
+- [[id:llm-agent-research-009][Dependency choices]]
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Created core architecture, config, execution and canonical-value design. | GPT-5.6 Sol | Research 001, 006, 009 |
+
+* Footnotes and Glossary
+
+- *Extension map*: provider-native data retained without contaminating standardized core fields.
+- *Monotonic deadline*: timeout deadline based on a clock unaffected by wall-clock jumps.
+- *Resolved configuration*: the concrete explicit/default/environment values selected for one operation.

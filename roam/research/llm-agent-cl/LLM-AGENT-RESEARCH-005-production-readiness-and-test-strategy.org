@@ -2,98 +2,156 @@
 :ID: llm-agent-research-005
 :END:
 #+title: Production readiness and test strategy research
-#+description: Quality gates required before llm-agent-cl can be described as production-ready.
+#+description: Quality gates required before llm-agent-cl or its maintained Carrier dependency can be described as production-ready.
 #+status: DRAFT
-#+filetags: :llm-agent-cl:research:testing:production:ci:
+#+filetags: :llm-agent-cl:research:testing:production:ci:parity:
 
 * Approval Table
 
 | Approval area | Required authority | State | Evidence required | Evidence reference |
 |---------------+--------------------+-------+-------------------+--------------------|
-| Test strategy | Maintainer | PENDING | Review of matrix and CI cost | This note |
+| Test strategy | Maintainer | PENDING | Review full conformance matrix | This note |
 | Production claim | Maintainer | NOT STARTED | Passing release gates | Future evidence |
-| Implementation authorization | Maintainer | NOT STARTED | Approved design | None |
+| Feature-parity claim | Maintainer | NOT STARTED | Full required parity matrix green | Research 001 |
+| Implementation authorization | Maintainer | NOT STARTED | Approved designs | None |
 
 * Principle
 
-“Production ready” is an observed release property, not an architecture adjective. The project must not claim it until the failure, compatibility, and integration matrix is automated and green for a release candidate.
+“Production ready” and “feature parity” are observed release properties, not architecture adjectives. The project must not claim either until their automated evidence is green for a release candidate.
 
-* Required test classes
+* Deterministic core/provider tests
 
-**Deterministic unit/conformance tests**
-
-- canonical message/content round trips;
+- canonical message/content/usage/profile round trips;
 - provider request/response fixtures;
+- config precedence and secret redaction;
 - JSON Schema tool validation;
 - tool-call correlation and parallel ordering;
-- structured-output validation and fallback;
+- structured-output validation/fallback;
 - middleware ordering and error propagation;
-- graph routing, recursion limits, state merges, subgraphs;
-- checkpoint serialization/resume and corruption handling;
-- interrupt/resume semantics;
-- secret redaction and safe printing.
+- model capability caching/staleness;
+- graph routing, reducers, Send/Command, recursion limits and subgraphs;
+- checkpoint serialization/resume/corruption handling;
+- pending-write recovery;
+- interrupt/resume/time-travel semantics;
+- long-term store behavior.
 
-**Streaming torture tests**
+* Streaming torture tests
 
-Fixture streams must be replayed with every byte boundary split, random chunking, delayed chunks, SSE comments, multiline data, fragmented UTF-8, fragmented tool JSON, duplicate/late usage, cancellation, consumer failure, and provider errors after prior successful tokens.
+Replay fixture streams across every byte boundary plus randomized chunking:
 
-**Transport contract tests**
+- SSE comments/keepalives;
+- multiline data;
+- fragmented UTF-8;
+- fragmented tool JSON;
+- structured-output partial JSON;
+- duplicate/late usage;
+- cancellation;
+- consumer failure/backpressure;
+- provider error after successful tokens;
+- premature EOF.
 
-Run identical behavioral suites against Dexador sync and every async backend candidate. Carrier is the reference native async implementation, but stock Carrier must fail the production gate until TLS certificate/hostname verification, cancellation, deterministic timeout behavior, and connection reuse are proven. A libcurl-multi backend must pass the same suite if selected. Provider code must not require transport-specific branches.
+* Transport conformance
 
-Required transport security tests include:
+Run equivalent behavioral suites against Dexador sync and the approved hardened =lost-rob0t/carrier= async adapter where semantics overlap. A provider must not need separate business logic for each transport.
 
-- trusted local CA success;
-- self-signed/untrusted certificate failure;
-- hostname mismatch failure;
-- expired certificate failure;
-- SNI routing with independent hostname verification;
-- redirect across origins with authorization stripping policy;
-- cancellation during DNS/connect/TLS/header/body phases;
-- repeated completion/cancellation race safety;
-- connection reuse without credential or response cross-talk.
+Carrier itself has its own stricter security/lifecycle release gate from Design 006: TLS chain+hostname fixtures, cancellation/deadline races, connection reuse/shutdown, binary/streaming bodies, redirect credential safety and resource/leak tests.
 
-**Live provider tests**
+* Live OpenRouter tests
 
-Credential-gated OpenRouter CI tests must be separate from deterministic tests. They should use a deliberately bounded token/cost budget, a configurable known-compatible model, and assert real non-stream, stream, tool, multi-turn, cancellation where supported, and error behavior. Absence of credentials should skip only this class, not the deterministic suite.
+Credential-gated tests are separate from deterministic CI and use bounded token/cost budgets. Cover:
 
-**MCP interoperability tests**
+- non-stream chat;
+- streaming chat;
+- tool call;
+- structured output;
+- multi-turn state at llm-agent layer;
+- model discovery/capability profile;
+- embeddings single/batch;
+- cancellation where downstream behavior is observable;
+- representative error/rate-limit paths where safely reproducible.
+
+Absence of credentials skips only live tests.
+
+* Graph/agent conformance
+
+Required scenarios:
+
+- deterministic reducer conflicts/order;
+- conditional routes;
+- dynamic Send map/reduce;
+- Command update+routing;
+- bounded parallel supersteps;
+- failed sibling task + persisted successful pending writes;
+- interrupt/resume;
+- subgraph checkpoint namespaces;
+- checkpoint history/replay/fork;
+- high-level model/tool loop with one and parallel tools;
+- budgets/recursion/cancellation;
+- typed graph/model/tool event streams.
+
+* Retrieval parity tests
+
+First-major-milestone release evidence includes:
+
+- document/provenance behavior;
+- text/JSON/CSV/HTML/HTTP representative loaders;
+- lazy loader cancellation and limits;
+- character/recursive/token splitter edge cases;
+- deterministic fake and live OpenRouter embeddings;
+- embedding cache;
+- store operations;
+- exact in-memory vector ranking/filtering;
+- retriever sync/async/batch;
+- complete load -> split -> embed -> store -> retrieve -> generate workflow;
+- retrieval used as graph node and agent tool.
+
+* MCP interoperability
 
 - current 2026-07-28 stdio fixture server/client;
-- current Streamable HTTP fixture;
+- current Streamable HTTP JSON/SSE fixture;
 - tool/resource/prompt discovery;
 - structured/multimodal tool results;
 - cancellation;
-- selected older protocol fixtures to prove compatibility or explicit rejection.
+- server export round trip;
+- selected older protocol fixture proving compatibility or explicit rejection.
 
-**Fault injection**
+* Fault injection
 
-DNS/TLS failures, connect/read timeouts, HTTP 429/5xx, malformed JSON, mid-stream disconnect, repeated tool failures, checkpoint write failure, cancellation races, and retry exhaustion all require typed terminal outcomes.
+Inject DNS/TLS failures, connect/read/deadline expiry, HTTP 429/5xx, malformed JSON, mid-stream disconnect, repeated tool failure, checkpoint failure, cancellation races, vector dimension errors, embedding provider errors, MCP process exits and retry exhaustion. All require typed terminal outcomes and deterministic cleanup.
 
-* Portability and API compatibility
+* Portability/API compatibility
 
-SBCL should be the initial reference implementation environment. Additional Common Lisp implementations should enter the support matrix only after dependencies and CI are verified. Public APIs require semantic versioning and deprecation policy before 1.0 stability claims.
+SBCL is the initial reference production environment. Additional Common Lisp implementations become supported only with CI evidence across their relevant dependency paths. Public APIs use semantic versioning and migration/deprecation notes for breaking changes.
 
-* Observability contract
+* Observability
 
-The library should emit structured events/hooks for model request start/end, stream deltas, tool execution, retries, state transitions, checkpoint operations, token usage, latency, and errors. It must not require a hosted tracing vendor.
+Structured hooks/events cover request/model/tool/retrieval/graph/checkpoint/MCP operations, retries, state transitions, token usage and latency. No hosted tracing vendor is required. Secrets are redacted before observers see payloads.
 
-* Release gate recommendation
+* First-major-milestone release gate
 
-A production release requires deterministic tests green, live OpenRouter integration green for the release candidate when credentials are available, no unresolved P0/P1 correctness defects, documented provider capability matrix, documented transport/TLS matrix, documented portability matrix, and explicit unsupported-feature behavior.
+A parity-complete production milestone requires:
+
+1. deterministic suites green;
+2. Carrier hardened release gates green and pinned;
+3. live OpenRouter integration green for the release candidate when credentials are available;
+4. graph/agent, retrieval and MCP matrices green;
+5. no unresolved P0/P1 correctness/security defects;
+6. documented provider/model capability matrix;
+7. documented Lisp/dependency support matrix;
+8. explicit unsupported-feature behavior rather than silent omission.
 
 * Sources
 
-Research basis retrieved 2026-08-12 from the LangChain/LangGraph/OpenRouter/MCP sources linked in the sibling research notes, Carrier/cl-async source reviewed in research 003/007, and the canonical workflow rules mirrored from `starintel-auto-research/AGENTS.md`.
+Research basis retrieved 2026-08-12 from current LangChain/LangGraph/OpenRouter/MCP sources in sibling notes, Carrier/cl-async source and the canonical workflow rules.
 
 * Changelog
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
-| 2026-08-12 | Added Carrier/libcurl transport conformance and mandatory TLS-verification test gates. | GPT-5.6 Sol | Research 003/007 |
-| 2026-08-12 | Established deterministic, live, streaming, MCP, transport, and fault-injection release gates. | GPT-5.6 Sol | Cross-source research pass |
+| 2026-08-12 | Updated release gates for maintained Carrier, full graph semantics, OpenRouter embeddings and mandatory retrieval parity. | GPT-5.6 Sol | Research 001-009 and maintainer decisions |
+| 2026-08-12 | Established initial deterministic/live/streaming/MCP/fault release gates. | GPT-5.6 Sol | Initial research pass |
 
 * Footnotes and Glossary
 
-- *Conformance test*: a reusable behavioral test applied to every implementation of an interface.
-- *Release gate*: evidence that must pass before a release can carry a quality claim.
+- *Conformance test*: reusable behavioral suite applied to every implementation of a public protocol.
+- *Release gate*: evidence that must pass before a release carries a quality/parity claim.

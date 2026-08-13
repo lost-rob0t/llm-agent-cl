@@ -1,0 +1,205 @@
+:PROPERTIES:
+:ID: llm-agent-design-005
+:END:
+#+title: MCP integration design
+#+description: Proposed current MCP 2026-07-28 client/server protocol modules, stdio and Streamable HTTP bindings, canonical adapters and legacy compatibility boundary.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:design:mcp:json-rpc:stdio:http:tools:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| MCP package/protocol design | Maintainer | PENDING | Review this design | Research 004 |
+| Compatibility boundary | Maintainer | PENDING | Review selected legacy support approach | This design |
+| Server-export scope | Maintainer | PENDING | Review same-major-milestone placement | This design |
+| Implementation authorization | Maintainer | NOT STARTED | Explicit approval | None |
+
+* Systems
+
+Proposed systems:
+
+- =llm-agent/mcp= — JSON-RPC values, capability/version negotiation, canonical client/server protocols;
+- =llm-agent/mcp-stdio= — stdio client/server transport;
+- =llm-agent/mcp-http= — Streamable HTTP binding through common HTTP/SSE contracts;
+- =llm-agent/mcp-server= — export native llm-agent tools/resources/prompts;
+- =llm-agent/mcp-compat= — explicitly tested older protocol codecs/behavior.
+
+The agent and tool layers depend only on canonical MCP adapters, never transport-specific stdio/process classes.
+
+* Current normative baseline
+
+Primary target is MCP 2026-07-28 as resolved by the research pass. Encode protocol version explicitly in every connection/request context; do not infer current semantics from old SDK examples.
+
+Current JSON-RPC requests/responses/errors use self-contained per-request protocol/capability metadata. Standard transports are stdio and Streamable HTTP.
+
+* JSON-RPC core
+
+Implement strict JSON-RPC 2.0 parsing/serialization with:
+
+- request ids preserving number/string identity;
+- notifications without ids;
+- result vs error mutual exclusion;
+- standard/custom error codes;
+- bounded message size/depth;
+- unknown method error mapping;
+- provider/protocol-native =_meta= preservation.
+
+Malformed messages produce protocol conditions rather than arbitrary Lisp errors escaping transport callbacks.
+
+* Capability and version context
+
+Each MCP peer/client tracks supported/current protocol versions and capabilities. For current 2026-07-28 semantics, request construction includes required per-request metadata. Feature calls check negotiated/known capabilities before dispatch where the spec requires it.
+
+Compatibility modules must be version-directed; do not create one permissive parser that mixes lifecycle rules from unrelated revisions.
+
+* Stdio client
+
+Client launches configured subprocess with explicit argv/environment/cwd policy. Transport:
+
+- writes newline-delimited JSON-RPC to stdin;
+- reads stdout incrementally;
+- treats stderr as diagnostic stream, never protocol JSON;
+- bounds line/message size;
+- tracks outstanding request ids;
+- propagates process exit to pending requests;
+- implements current stdio cancellation notification semantics;
+- kills/terminates child deterministically on client shutdown according to policy.
+
+Never execute shell strings implicitly. Accept executable + argv values; optional shell use is an explicit unsafe/convenience adapter outside the secure default.
+
+* Streamable HTTP client
+
+Use common transport request/stream contracts. Current binding:
+
+- POST each MCP message to one endpoint;
+- response may be ordinary JSON or request-scoped SSE;
+- protocol metadata originates in body =_meta=; any mirrored headers remain transport detail;
+- cancellation abandons/closes the request response stream through transport cancellation;
+- authentication/configuration is caller supplied through HTTP/client policy, not model-controlled tool parameters.
+
+The HTTP adapter reuses the tested SSE decoder rather than implementing separate line parsing.
+
+* MCP client object
+
+Client API supports:
+
+- list/refresh tools;
+- call tool;
+- list/read resources and templates;
+- subscribe/unsubscribe where supported;
+- list/get prompts;
+- progress/event callbacks;
+- cancellation/deadline;
+- close/shutdown.
+
+Cache discovered lists with invalidation on list-change notifications/events. Discovery snapshots include server identity/version/capabilities and fetched timestamp.
+
+* Canonical tool mapping
+
+Each discovered MCP tool maps to a native canonical tool descriptor:
+
+- stable namespaced name to avoid collisions across MCP servers;
+- original MCP server/tool identity retained in metadata;
+- input JSON Schema -> canonical tool schema;
+- output schema retained when supplied;
+- invocation closure delegates through MCP client;
+- MCP content result -> canonical content blocks/tool result;
+- is-error/protocol errors -> typed tool/MCP conditions.
+
+A model never receives raw ability to select arbitrary MCP connection configuration.
+
+* Resources and prompts
+
+Resources map to canonical typed resource/document-ish content without conflating resources with vector retrieval. Preserve URI, mime type, annotations and embedded text/blob data.
+
+Prompts map to prompt-template values/messages and retain required arguments/metadata. An application may choose to expose them to an agent; discovery alone does not mutate the active system prompt.
+
+* MCP server export
+
+Server module exposes registered llm-agent native tools/resources/prompts through MCP. It is an optional library system, not a daemon requirement. Applications choose stdio or Streamable HTTP hosting/integration.
+
+Tool export:
+
+- canonical input schema -> MCP inputSchema;
+- optional output schema -> outputSchema;
+- canonical content blocks -> MCP content variants where representable;
+- unsupported content signals or uses explicit conversion policy;
+- progress/cancellation bridged to runtime context.
+
+Resource/prompt registries follow the same explicit registration model.
+
+* Security/trust boundary
+
+Remote MCP metadata is untrusted. Requirements:
+
+- validate schemas and message sizes;
+- sanitize names for display/namespace without losing original identity;
+- tool descriptions cannot change local authorization policy;
+- model cannot alter server endpoint/credentials unless the application intentionally exposes such a tool;
+- local allow/deny middleware can filter discovered tools/resources;
+- never log MCP auth headers/secrets;
+- HTTP server implementation applies Origin/auth rules required by current spec;
+- stdio environment inherited by subprocess should be explicit/filterable.
+
+* Legacy compatibility
+
+Support selected older MCP revisions only through fixtures and version-specific adapters. Initial compatibility research should target the immediately useful session-oriented 2025-era revision(s) encountered in real servers.
+
+Compatibility implementation may emulate initialization/session ids/server requests where the older revision requires them, but must return canonical client/tool/resource results above that layer.
+
+If an unknown protocol version cannot be handled safely, fail with =unsupported-mcp-version= rather than guessing.
+
+* Cancellation
+
+Public MCP future/request ids integrate with runtime cancellation token.
+
+- stdio current binding sends cancellation notification and marks local request cancelled;
+- Streamable HTTP cancels/abandons the underlying HTTP response stream;
+- late responses after local terminal cancellation are discarded/traced safely;
+- exported server tools receive child cancellation tokens.
+
+* Tests
+
+Fixture/interoperability tests include:
+
+- current 2026-07-28 stdio server/client;
+- current Streamable HTTP ordinary JSON and SSE response;
+- tools list/call with structured and multimodal result;
+- resources/templates/prompts;
+- list-change invalidation;
+- cancellation/deadline;
+- malformed JSON-RPC/unknown id/mismatched result;
+- child process failure;
+- authorization/redaction checks;
+- server export round trip;
+- selected legacy protocol fixture proving compatibility or explicit rejection.
+
+No external MCP server is required for deterministic CI.
+
+* Implementation order
+
+1. JSON-RPC + current protocol values/capabilities.
+2. stdio client + deterministic fixture server.
+3. canonical tool/resource/prompt adapters.
+4. Streamable HTTP client using existing transport/SSE.
+5. server export.
+6. selected legacy compatibility modules.
+
+* Related research/design
+
+- [[id:llm-agent-research-004][Approved MCP research]]
+- [[id:llm-agent-design-001][Core contracts]]
+- [[id:llm-agent-design-002][HTTP/SSE]]
+- [[id:llm-agent-design-003][Agent/tool runtime]]
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Created MCP client/server, transport and compatibility implementation design. | GPT-5.6 Sol | Approved research 004 and MCP 2026-07-28 spec |
+
+* Footnotes and Glossary
+
+- *Namespaced tool name*: local collision-resistant name combining MCP server identity with remote tool name.
+- *Protocol compatibility module*: version-specific lifecycle/codec implementation isolated below canonical MCP APIs.

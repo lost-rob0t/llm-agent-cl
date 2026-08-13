@@ -1,0 +1,231 @@
+:PROPERTIES:
+:ID: llm-agent-design-002
+:END:
+#+title: OpenRouter provider, transport and streaming design
+#+description: Proposed OpenRouter chat/models/embeddings adapter, Dexador and Carrier transports, structured outputs, SSE normalization and provider configuration.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:design:openrouter:provider:streaming:transport:embeddings:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| OpenRouter API design | Maintainer | PENDING | Review endpoint/capability mapping | Research 002 |
+| Transport adapter design | Maintainer | PENDING | Review Dexador/Carrier semantics | Research 003/007 |
+| Streaming/retry design | Maintainer | PENDING | Review state/error rules | This design |
+| Implementation authorization | Maintainer | NOT STARTED | Explicit approval + Carrier design where async used | None |
+
+* Systems and package boundaries
+
+Proposed systems:
+
+- =llm-agent/sse= — transport-independent incremental SSE decoder;
+- =llm-agent/transport-dexador= — synchronous transport backend;
+- =llm-agent/transport-carrier= — asynchronous backend pinned to the maintained Carrier fork release;
+- =llm-agent/provider-openrouter= — OpenRouter chat/models/embeddings/capability mapping.
+
+Provider code depends on the transport protocol, not Dexador/Carrier directly. The SSE decoder consumes byte chunks from either backend.
+
+* Provider client
+
+An OpenRouter client/config contains:
+
+- API key or deferred credential resolver;
+- base URL, default =https://openrouter.ai/api/v1=;
+- default chat model;
+- default embedding model;
+- routing/provider preferences;
+- optional attribution headers/site metadata;
+- model capability cache policy;
+- transport selection/config;
+- retry policy;
+- middleware/event hooks.
+
+Configuration resolution follows Design 001: explicit call > client > dynamic > process default > =OPENROUTER_API_KEY= for credentials.
+
+* Endpoint families
+
+**Chat Completions** is the initial stable chat foundation at =POST /chat/completions=.
+
+**Models** provides discovery/profile data used for capability checks and routing. Preserve the full OpenRouter model record and normalize context length, modalities, supported parameters, pricing metadata and fetched timestamp.
+
+**Embeddings** uses =POST /embeddings= and the embeddings model listing endpoint. Support single and batch inputs, dimensions/encoding/input-type options where accepted, provider routing and usage normalization.
+
+**Responses** remains an optional beta endpoint family. It may have an adapter later but cannot define core conversation state or replace Chat Completions in the first production slice.
+
+* Chat request mapping
+
+Translate canonical messages/content/tools to OpenRouter JSON. Reject unsupported canonical content blocks explicitly unless a documented provider fallback exists.
+
+Expose provider-specific request extensions for routing, transforms and future OpenRouter fields without adding them to every provider's canonical interface.
+
+Tool definitions include canonical name, description and JSON Schema parameters. Tool-call ids are never regenerated after provider response normalization.
+
+* Structured output
+
+Canonical structured-output request supports:
+
+- schema/name;
+- strict flag defaulting true when provider-native enforcement is selected;
+- provider-native strategy preference;
+- tool-mediated fallback preference;
+- final validation policy.
+
+For OpenRouter provider-native strategy emit:
+
+#+begin_src json
+{
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "...",
+      "strict": true,
+      "schema": {}
+    }
+  }
+}
+#+end_src
+
+Before dispatch, use model capability data when available. When routing through multiple providers and the request requires structured output/tools/etc., apply OpenRouter's =require_parameters= routing option where appropriate. Stale/absent capability information cannot cause silent field removal; either attempt with explicit provider behavior or signal unsupported according to caller policy.
+
+For streaming structured output, emit raw/partial structured-text deltas as stream events. Parse/validate the complete JSON only at terminal completion. A syntactically incomplete partial value is not a schema error until the stream ends unexpectedly or completion is declared.
+
+* SSE decoder
+
+The SSE system accepts arbitrary octet chunks and incrementally decodes UTF-8/framing. It must handle:
+
+- UTF-8 split inside a multibyte code point;
+- CRLF or LF lines;
+- blank event delimiters;
+- =:= comments/keepalives;
+- repeated/multiline =data:= fields;
+- optional event/id/retry fields;
+- EOF with an incomplete event;
+- bounded internal buffers/body/event size.
+
+OpenRouter mapping then interprets =data:= payloads as JSON or terminal =[DONE]=. HTTP chunk boundaries are irrelevant.
+
+* Stream event model
+
+Normalize provider stream data into typed events such as:
+
+- =message-start=;
+- =text-delta=;
+- =reasoning-delta=;
+- =tool-call-start=;
+- =tool-call-arguments-delta=;
+- =tool-call-ready=;
+- =structured-output-delta=;
+- =usage=;
+- =provider-metadata=;
+- =message-complete=;
+- =stream-error= / =stream-cancelled=.
+
+Tool arguments are assembled by call index/id and parsed only when complete. Preserve raw fragments for diagnostics within safe size limits.
+
+* Sync transport: Dexador
+
+Dexador adapter responsibilities:
+
+- canonical request -> Dexador options;
+- TLS defaults remain verified;
+- response status/headers/body normalization;
+- streaming body path capable of feeding SSE incrementally rather than reading the entire response when the API supports it;
+- deadline/timeout translation as far as Dexador permits;
+- typed condition normalization;
+- deterministic closure.
+
+If Dexador cannot provide an exact async-style cancellation primitive for a blocking sync call, the sync contract documents cancellation points rather than pretending preemption is guaranteed.
+
+* Async transport: Carrier
+
+The Carrier adapter targets the **hardened maintained fork release**, not current stock master. It uses the new client/request-handle API from Design 006 for:
+
+- verified TLS;
+- request cancellation;
+- incremental headers/body;
+- absolute/connect/read/idle deadlines;
+- connection reuse;
+- deterministic shutdown.
+
+Blackbird promises and cl-async sockets are converted to project-owned future/stream values.
+
+* Cancellation
+
+Cancellation token callback invokes Carrier request cancellation for async requests. Once cancellation wins the terminal-state race:
+
+- no more public deltas are emitted;
+- the stream terminates with typed cancelled state;
+- late transport callbacks are discarded safely;
+- the provider result cannot later become successful.
+
+OpenRouter may continue upstream work depending on downstream provider behavior, but local network processing must terminate immediately and accurately report local cancellation.
+
+* Retry classification
+
+Automatic retry allowed only when policy and failure stage make it safe. Examples:
+
+- DNS/connect failure before request write: usually safe;
+- retryable 429/5xx before response content: policy-controlled;
+- failure after unknown amount of request was transmitted: potentially ambiguous;
+- once stream content/tool deltas are emitted: no transparent replay;
+- embedding request: may retry pre-response under bounded policy because it is side-effect-free, but still respect deadlines/rate limits.
+
+Honor =Retry-After= where valid. Apply bounded exponential backoff + jitter. Emit retry events without secrets.
+
+* Errors
+
+Normalize:
+
+- HTTP status failures;
+- OpenRouter JSON error envelopes;
+- model/provider unsupported fields;
+- malformed JSON;
+- SSE parse limits;
+- mid-stream error payloads after HTTP 200;
+- incomplete tool argument JSON;
+- final structured-output validation failures;
+- usage/model metadata inconsistencies.
+
+A partial-stream error includes already-observed usage/content metadata so applications can make informed decisions.
+
+* Capability cache
+
+Cache Models API records per base URL/credentials visibility context with fetched-at timestamp and configurable TTL. Expose force-refresh and no-cache modes. Capability decisions record whether they came from cache, live model profile or caller override.
+
+* Live and deterministic tests
+
+Deterministic fixtures cover request JSON, ordinary responses, every-byte SSE fragmentation, keepalives, tool deltas, structured output, mid-stream errors, usage and retry classification.
+
+Transport conformance runs the same local fixture server behavior through Dexador and hardened Carrier where semantics overlap.
+
+Credential-gated OpenRouter tests cover:
+
+- non-stream chat;
+- stream chat;
+- a tool call;
+- structured output with a compatible model;
+- embeddings single/batch;
+- model discovery;
+- cancellation where observable.
+
+Live tests have strict token/cost budgets and are never required for contributors without credentials; deterministic CI remains mandatory.
+
+* Related research/design
+
+- [[id:llm-agent-research-002][OpenRouter research]]
+- [[id:llm-agent-research-003][Transport research]]
+- [[id:llm-agent-research-007][Carrier fork decision]]
+- [[id:llm-agent-design-001][Core contracts]]
+- [[id:llm-agent-design-006][Carrier hardening]]
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Created OpenRouter, transport, SSE, structured-output and embedding provider design. | GPT-5.6 Sol | Research 002/003/007 and current OpenRouter docs |
+
+* Footnotes and Glossary
+
+- *Capability cache*: time-bounded local model metadata used to reject/route incompatible requests before dispatch.
+- *Terminal-state race*: competition between completion, failure, cancellation and timeout callbacks; exactly one may win.

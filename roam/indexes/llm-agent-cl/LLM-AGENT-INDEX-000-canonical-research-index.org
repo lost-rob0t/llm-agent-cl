@@ -2,19 +2,23 @@
 :ID: llm-agent-index-000
 :END:
 #+title: llm-agent-cl canonical research index
-#+description: Canonical research map for the llm-agent-cl multi-provider LLM and agent library.
+#+description: Canonical research map and handoff into the llm-agent-cl implementation design review set.
 #+status: DRAFT
-#+filetags: :llm-agent-cl:index:research:
+#+filetags: :llm-agent-cl:index:research:design:
 
 * Approval Table
 
 | Approval area | Required authority | State | Evidence required | Evidence reference |
 |---------------+--------------------+-------+-------------------+--------------------|
-| Research index | Maintainer | PENDING | Maintainer review | None yet |
+| Research index/completeness | Maintainer | PENDING | Review research 001-009 | Links below |
+| Design review handoff | Maintainer | PENDING | Review design index 000 | Link below |
+| Runtime implementation authorization | Maintainer | NOT STARTED | Explicit design approval | None |
 
 * Scope
 
-This index tracks canonical research for a production-oriented Common Lisp library with LangChain + LangGraph class capabilities, OpenRouter as the first provider, sync/async HTTP, streaming, tools, multi-turn state, and MCP. It explicitly does not authorize runtime implementation.
+This index tracks canonical research for a production-oriented Common Lisp library with mandatory LangChain + LangGraph behavioral feature parity, OpenRouter as the first provider, Dexador synchronous HTTP, maintained =lost-rob0t/carrier= asynchronous HTTP, streaming, tools, structured output, multi-turn state, graphs/checkpoints/interrupts/time travel, MCP, and the full first-milestone retrieval/data-plane family.
+
+Research is now complete enough to produce an implementation-ready design set for maintainer review. This does **not** authorize runtime implementation.
 
 * Canonical research
 
@@ -24,24 +28,56 @@ This index tracks canonical research for a production-oriented Common Lisp libra
 - [[id:llm-agent-research-004][MCP integration contract]]
 - [[id:llm-agent-research-005][Production readiness and test strategy]]
 - [[id:llm-agent-research-006][Library boundary and architecture implications]]
-- [[id:llm-agent-research-007][Carrier async HTTP client evaluation and hardening options]]
+- [[id:llm-agent-research-007][Carrier async HTTP client evaluation and maintained-fork decision]]
+- [[id:llm-agent-research-008][Retrieval, embeddings, vector stores and document pipeline parity]]
+- [[id:llm-agent-research-009][Common Lisp dependency and portability choices]]
 
-* Current blockers
+* Produced designs
 
-1. No runtime design is approved.
-2. The production async backend still needs a design choice between a hardened Carrier path and a small libcurl-multi client; stock Carrier is not acceptable unchanged because current TLS verification is disabled and cancellation/connection-reuse contracts are incomplete.
-3. OpenRouter provider-native structured-output details need a field-level conformance pass before implementation.
+- [[id:llm-agent-design-index-000][Implementation design index]]
 
-The earlier “Lobster” identity gap is closed: Carrier is the verified native async Common Lisp HTTP client used as the reference implementation for research.
+The design index links the six canonical designs for core contracts, OpenRouter/transports, graph/agent runtime, retrieval, MCP and Carrier hardening.
+
+* Maintainer decisions already incorporated
+
+- LangChain + LangGraph behavioral parity is required.
+- Documents/loaders/splitters/embeddings/stores/vector stores/retrievers/RAG belong in the first major parity milestone.
+- OpenRouter is the first provider.
+- Quick-test/REPL scoped/process/environment configuration conveniences are allowed; explicit configuration remains supported and overrides defaults.
+- MCP research/scope 004 is accepted as the research baseline.
+- =lost-rob0t/carrier= is the async HTTP fork the project will maintain and harden.
+- The earlier automatic libcurl fallback is superseded; changing away from Carrier requires a new maintainer decision.
+
+These decisions approve research direction, not the new implementation designs.
+
+* Remaining blockers before code
+
+1. The six design documents remain pending maintainer review/approval.
+2. Runtime implementation is explicitly not authorized until applicable designs are approved.
+3. Carrier hardening cannot begin until Design 006 is approved; after implementation it must satisfy its independent security/lifecycle release gates before llm-agent-cl treats it as production async transport.
+
+The earlier blockers around “Lobster,” provider-native structured-output field research, retrieval milestone placement and async backend selection are closed by research 002/003/007/008 and explicit maintainer decisions.
+
+* Implementation handoff after approval
+
+Use the one-active-design workflow only after explicit approval:
+
+#+begin_src sh
+python3 scripts/implement.py roam/design/llm-agent-cl/<approved-design>.org
+#+end_src
+
+Do not turn the entire design set into one unbounded implementation branch. Follow dependency order in the design index.
 
 * Changelog
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
-| 2026-08-12 | Added Carrier evaluation and replaced the unresolved Lobster identity blocker with an explicit production-hardening decision. | GPT-5.6 Sol | Research 003/007 and Carrier/cl-async upstream source |
-| 2026-08-12 | Created canonical research index and linked initial deep-research set. | GPT-5.6 Sol | Repository bootstrap research pass |
+| 2026-08-12 | Completed research set through 009, recorded maintainer decisions, linked the produced design set and replaced resolved blockers with design-approval gates. | GPT-5.6 Sol | Research 001-009 + explicit maintainer review |
+| 2026-08-12 | Added Carrier evaluation and replaced unresolved Lobster blocker. | GPT-5.6 Sol | Research 003/007 |
+| 2026-08-12 | Created canonical research index. | GPT-5.6 Sol | Initial auto-research pass |
 
 * Footnotes and Glossary
 
-- *Canonical node*: the authoritative research or design document for a topic.
-- *Parity*: equivalent behavioral capability, not source/API cloning.
+- *Canonical node*: authoritative research or design document for a topic.
+- *Parity*: equivalent behavioral capability and extension points, not a Python API/source clone or literal third-party-integration count.
+- *Design gate*: explicit maintainer approval required before implementation regardless of merge/CI state.

@@ -2,124 +2,120 @@
 :ID: llm-agent-research-003
 :END:
 #+title: HTTP transport and streaming contract research
-#+description: Sync/async HTTP, SSE streaming, cancellation, retries, backpressure, Carrier, and the production hardening boundary.
+#+description: Sync/async HTTP, SSE streaming, cancellation, retries, backpressure, Dexador and the maintained lost-rob0t/carrier production path.
 #+status: DRAFT
-#+filetags: :llm-agent-cl:research:http:streaming:dexador:carrier:libcurl:
+#+filetags: :llm-agent-cl:research:http:streaming:dexador:carrier:tls:
 
 * Approval Table
 
 | Approval area | Required authority | State | Evidence required | Evidence reference |
 |---------------+--------------------+-------+-------------------+--------------------|
-| Transport research | Maintainer | PENDING | Dependency review | Sources below |
-| Async client identity | Maintainer | PENDING | Authoritative upstream and source review | Carrier upstream verified |
-| Production async backend | Maintainer | NOT STARTED | Approved design plus security/conformance evidence | None |
-| Implementation authorization | Maintainer | NOT STARTED | Approved design | None |
+| Transport research | Maintainer | PENDING | Dependency/source review | Sources below |
+| Async client identity | Maintainer | APPROVED | Explicit maintained fork selection | =lost-rob0t/carrier= |
+| Production async backend direction | Maintainer | APPROVED | Explicit maintainer direction | 2026-08-12 review |
+| Implementation authorization | Maintainer | NOT STARTED | Approved Carrier + provider designs | Design set pending review |
 
 * Dexador
 
-Dexador is a Common Lisp HTTP client with connection pooling and condition-based HTTP failure behavior. It is MIT licensed and is the required synchronous transport for this project.
+Dexador is the required synchronous Common Lisp HTTP transport. It should remain behind the common transport protocol rather than leak into provider APIs. Provider code expresses method, URL, headers, body, response mode, deadline/cancellation metadata and stream sink/source through library-level contracts.
 
-Dexador should be hidden behind a transport protocol rather than exposed from provider APIs. Provider code should express request method, URL, headers, body, response mode, deadline/cancellation metadata, and stream sink/event source through library-level contracts.
+* Carrier: canonical maintained asynchronous client
 
-* Carrier: verified asynchronous Common Lisp client
+The async direction is now resolved. =https://github.com/lost-rob0t/carrier= is the canonical maintained fork for llm-agent-cl. GitHub identifies it as a fork of =orthecreedence/carrier=. At the time of this research its =master= tree is still the upstream =95ea9edba80f67598bfde550a170a2f787970223= tree, so no production hardening has yet been applied.
 
-Carrier is the actual asynchronous Common Lisp HTTP client that resolves the earlier search gap. Its upstream is =orthecreedence/carrier=. The ASDF system identifies version =0.1.1= under the MIT license and depends on =cl-async=, =cl-async-ssl=, Blackbird, =fast-http=, Quri, and related support libraries.
+Carrier is MIT-licensed and built on =cl-async=, =cl-async-ssl=, Blackbird, =fast-http=, Quri and support libraries. Its request contract already supplies the key shape required by OpenRouter SSE: non-blocking execution, response-header callback, incremental response-body byte callbacks and promise completion.
 
-Carrier's =request= function returns a Blackbird promise. Its public contract includes response-header callbacks, response-body callbacks receiving byte-array slices, a finish callback, redirects, cookies, and read timeout configuration. This is sufficient in shape to drive OpenRouter HTTP/1.1 Server-Sent Events without buffering the complete response.
+The llm-agent-cl adapter must not expose Blackbird or Carrier socket types publicly. Carrier is a transport backend, not the async semantic model of the entire library.
 
-The upstream implementation constructs requests itself, opens a non-blocking =cl-async= TCP or TLS connection, feeds response bytes through =fast-http=, and calls the body callback incrementally. The SSE parser should remain above Carrier so provider and transport code do not couple to HTTP chunk boundaries.
+* Why the fork must be hardened before use
 
-* Why stock Carrier is not production-ready unchanged
+**TLS verification is a hard blocker.** Current =cl-async-ssl:tcp-ssl-connect-new= loads verify paths but explicitly configures =SSL_VERIFY_NONE=. SNI is set, but SNI does not authenticate the peer. API keys and model traffic must never flow over this path until certificate-chain and hostname verification fail closed.
 
-Carrier satisfies the requirement to *find a native async Common Lisp HTTP client*, but current upstream cannot be the production backend without remediation.
+**Cancellation is not first-class.** Stock Carrier returns a promise while keeping the socket lexical inside =request=. The maintained fork needs a public request handle with idempotent cancellation.
 
-**TLS verification is a hard blocker.** Carrier uses =cl-async-ssl= for HTTPS. The current =cl-async-ssl:tcp-ssl-connect-new= creates an SSL context, loads default verify paths, then explicitly configures =SSL_VERIFY_NONE= and contains a TODO for better verification support. SNI is set, but SNI is not certificate/hostname verification. Provider credentials and model traffic must never be sent through a transport that does not verify the remote certificate and hostname.
+**Connection reuse is absent.** Stock Carrier closes the socket at response completion. The maintained fork needs bounded origin-keyed keep-alive reuse and reusable TLS contexts.
 
-**Cancellation is not first-class.** Carrier keeps the socket in lexical state inside =request= and returns only a promise. The implementation closes the socket on redirect and completion, but callers have no supported request handle that can be cancelled to deterministically tear down an in-flight request. llm-agent-cl requires cancellation propagation from graph/agent execution to provider and socket.
+**Timeout semantics are incomplete.** Read timeout exists, but production behavior needs connect, read/idle and absolute deadlines with one terminal-state machine.
 
-**Connection reuse is absent.** Carrier closes the socket after a completed response. It therefore does not provide a connection pool or persistent keep-alive reuse. This matters for provider latency, TLS handshake overhead, and concurrent production workloads.
+**Request serialization needs hardening.** The current request builder passes bodies through string serialization, which is not an acceptable generic binary-body contract. The fork should build header/body octets and support bounded streaming uploads.
 
-**TLS context reuse is an upstream performance gap.** Carrier issue #25 reports that creating and initializing the SSL context per request dominated high-rate request workloads; the reporter observed a large throughput improvement by reusing an SSL context. The feature is not part of Carrier's public API.
+**Redirect security must be explicit.** Authorization/cookie headers must not cross origins accidentally; redirect method rewriting and loop limits require deterministic tests.
 
-**SSL compatibility remains an upstream issue.** Carrier issue #16 documents HTTPS sites that fail under its SSL path.
+* Maintained-fork direction
 
-**Request-body streaming is absent.** Carrier issue #17 requests streaming request bodies. OpenRouter's initial JSON request bodies are bounded and do not require this feature, but the generic transport contract should not pretend it exists.
+The active implementation direction is no longer “Carrier or libcurl.” The maintainer has selected and will maintain =lost-rob0t/carrier=. The project should therefore:
 
-**Testing is thin.** Carrier issue #13 explicitly asks for HTTPBin testing; a production dependency therefore requires llm-agent-cl-owned conformance and live integration tests regardless of upstream test coverage.
+1. harden that fork as a standalone async HTTP client;
+2. preserve reasonable backward compatibility for existing Carrier callers;
+3. add new production client/request-handle APIs without forcing llm-agent-cl semantics into Carrier;
+4. tag/release a tested hardening version before llm-agent-cl pins it;
+5. keep llm-agent-cl's transport conformance suite backend-neutral.
 
-* Production backend strategy
-
-The async HTTP interface must not expose Carrier-specific promise/socket types. The future design should use this order:
-
-1. **Hardened Carrier path** — fork or patch Carrier/cl-async-ssl only if verified certificate + hostname validation, cancellation, deterministic cleanup, connection reuse/TLS-context reuse, and required timeout semantics can be implemented cleanly and covered by tests.
-2. **libcurl multi path** — if Carrier hardening is brittle, implement a small Common Lisp async client/adapter over libcurl's multi interface using CFFI. libcurl multi is event-driven, supports many concurrent transfers in one thread, permits removing an easy handle to cancel a transfer, and can integrate with an event loop. Modern libcurl also provides mature TLS verification, connection reuse, HTTP/2 multiplexing, and HTTP/3 where built with support.
-
-A libcurl-multi adapter is preferable to 'Dexador in a worker thread' because it is genuinely asynchronous and preserves cancellation/backpressure semantics at the network layer.
+The earlier libcurl-multi research remains useful contingency evidence but is =SUPERSEDED= as the active path. Switching transports later requires a new maintainer decision; it is not an automatic fallback during implementation.
 
 * Unified sync/async semantics
 
-Both transports must expose equivalent outcomes:
+Dexador and Carrier adapters must expose equivalent library-level outcomes:
 
 - request accepted / response received;
-- response headers available before body completion where streaming requires it;
+- response headers before body completion where streaming requires it;
 - body byte stream or complete body;
-- cancellation;
-- absolute deadline and connect/read timeout policy;
-- typed DNS/TLS/connect/protocol/status/body-decode errors;
-- deterministic cleanup;
-- optional proxy/TLS configuration;
-- connection reuse;
-- observability metadata.
+- explicit cancellation;
+- absolute deadline plus connect/read/idle timeout policy;
+- typed DNS/TLS/connect/protocol/status/decode/cancelled errors;
+- deterministic cleanup exactly once;
+- optional proxy/TLS policy;
+- connection reuse where supported;
+- observability metadata and byte counts.
 
-Async invocation must not be 'run Dexador in a background thread' except as a separately documented portability fallback. Native async transport behavior is the requirement.
+Async invocation must be natively asynchronous. “Run Dexador in a background thread” is not the primary async provider transport.
 
 * SSE layer
 
-SSE parsing belongs above HTTP so both transports feed identical bytes/events into one parser. Required parser tests include:
+SSE parsing belongs above HTTP so sync and async transports feed identical bytes into one parser. Required parser tests include:
 
 - UTF-8 code points split across reads;
-- CRLF and LF framing;
+- CRLF/LF framing;
 - comment/keepalive lines;
 - multiple =data:= lines;
 - events split at every possible byte boundary;
-- terminal =[DONE]= or provider equivalent handling;
+- terminal =[DONE]= or provider equivalent;
 - malformed JSON;
-- a provider error after earlier successful deltas;
-- consumer cancellation and slow-consumer backpressure.
+- tool-call JSON fragmented across events;
+- provider error after successful deltas;
+- cancellation and slow-consumer backpressure.
 
-The output should be typed stream events, including content deltas, reasoning/metadata deltas, tool-call deltas, usage, completion, and terminal errors.
+The output is typed stream events including text/content deltas, reasoning/metadata deltas, tool-call deltas, usage, completion and terminal errors.
 
 * Retry and cancellation rules
 
-Retries must be bounded, policy-driven, jittered where delay applies, and classified by failure stage. Never automatically replay a request after tokens/tool calls have been observed. Cancellation must propagate from agent/graph -> provider -> HTTP transport and produce a typed cancelled terminal state.
+Retries are bounded, policy-driven and jittered where delay applies. Never automatically replay a request after observable content/tool-call side effects. Cancellation propagates graph -> agent -> provider -> HTTP request handle and yields one typed cancelled terminal state.
 
 * Sources
 
 Retrieved 2026-08-12.
 
 - https://github.com/fukamachi/dexador
+- https://github.com/lost-rob0t/carrier
 - https://github.com/orthecreedence/carrier
-- https://github.com/orthecreedence/carrier/blob/master/carrier.asd
 - https://github.com/orthecreedence/carrier/blob/master/carrier.lisp
 - https://github.com/orthecreedence/carrier/issues/13
 - https://github.com/orthecreedence/carrier/issues/16
 - https://github.com/orthecreedence/carrier/issues/17
 - https://github.com/orthecreedence/carrier/issues/25
 - https://github.com/orthecreedence/cl-async/blob/master/src/ssl/tcp.lisp
-- https://curl.se/libcurl/c/libcurl-multi.html
-- https://everything.curl.dev/libcurl-http/multiplexing.html
+- https://curl.se/libcurl/c/libcurl-multi.html (historical contingency research)
 - https://openrouter.ai/docs/api/reference/streaming
 
 * Changelog
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
-| 2026-08-12 | Replaced unresolved Lobster assumption with verified Carrier research and documented Carrier security/production gaps plus libcurl-multi fallback. | GPT-5.6 Sol | Carrier/cl-async source, upstream issues, libcurl documentation |
-| 2026-08-12 | Defined transport/streaming requirements and recorded unresolved async dependency. | GPT-5.6 Sol | Dexador/OpenRouter docs plus repository search |
+| 2026-08-12 | Selected =lost-rob0t/carrier= as canonical maintained async backend and superseded automatic libcurl fallback. | GPT-5.6 Sol | Explicit maintainer direction and fork inspection |
+| 2026-08-12 | Replaced unresolved Lobster assumption with verified Carrier research and production gap analysis. | GPT-5.6 Sol | Carrier/cl-async source and upstream issues |
 
 * Footnotes and Glossary
 
 - *Backpressure*: preventing a producer from unboundedly outrunning a stream consumer.
-- *Transport adapter*: implementation that maps the library's HTTP contract to a concrete HTTP library.
-- *SNI*: TLS Server Name Indication; it selects a server identity but does not itself verify the certificate.
-- *libcurl multi*: libcurl's non-blocking interface for driving many transfers from one event loop/thread.
+- *Transport adapter*: implementation mapping llm-agent-cl's HTTP contract to a concrete HTTP library.
+- *SNI*: TLS Server Name Indication; routing metadata, not peer verification.
