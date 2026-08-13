@@ -1,0 +1,67 @@
+:PROPERTIES:
+:ID: llm-agent-design-index-000
+:END:
+#+title: llm-agent-cl implementation design index
+#+description: Canonical implementation-ready design set produced after the initial auto-research phase.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:index:design:implementation:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| Design set completeness | Maintainer | PENDING | Review designs 001-006 | Links below |
+| Implementation authorization | Maintainer | NOT STARTED | Explicit approval of applicable designs | None |
+
+* Purpose
+
+This index is the handoff from research into maintainer design review. It does not itself authorize code changes. Merging these documents only publishes the proposed architecture.
+
+* Canonical designs
+
+- [[id:llm-agent-design-001][Core library architecture and public contracts]]
+- [[id:llm-agent-design-002][OpenRouter provider, transport and streaming]]
+- [[id:llm-agent-design-003][Agent and graph runtime]]
+- [[id:llm-agent-design-004][Retrieval and data plane]]
+- [[id:llm-agent-design-005][MCP integration]]
+- [[id:llm-agent-design-006][Carrier maintained-fork hardening]]
+
+* Dependency-aware implementation sequence
+
+If the maintainer approves the design set, implementation should proceed in dependency order rather than attempting one giant feature branch:
+
+1. **Core contracts** — packages, canonical values, config, conditions, cancellation/future/event primitives and test harness.
+2. **Carrier hardening** — in =lost-rob0t/carrier=, independently tested/tagged before production async provider use.
+3. **OpenRouter + transports** — Dexador sync, Carrier async, SSE, chat/models/embeddings/structured output.
+4. **Graph + agent runtime** — state/reducers/supersteps/checkpoints/interrupts/tools/high-level agent.
+5. **Retrieval/data plane** — documents/loaders/splitters/embeddings/stores/vector stores/retrievers and minimal RAG.
+6. **MCP** — current client bindings first, then server export and compatibility fixtures.
+7. **Parity closure** — run the full first-major-milestone matrix and close missing behavioral gaps before claiming feature parity.
+
+Parallel work is acceptable only where dependency contracts are already stable. Each slice should get its own tests and PR rather than accumulating an unreviewable monolith.
+
+* First-major-milestone definition
+
+The first major milestone includes all capability classes required by [[id:llm-agent-research-001][parity research]], including retrieval. It is not complete merely when OpenRouter chat and a tool loop work.
+
+* Review guidance
+
+The highest-impact choices to review are:
+
+- public canonical type shapes and extension maps in Design 001;
+- configuration precedence and provider capabilities in Design 002;
+- graph reducer/superstep/checkpoint semantics in Design 003;
+- retrieval protocol/built-in scope in Design 004;
+- current-vs-legacy MCP compatibility boundary in Design 005;
+- TLS/cancellation/pooling/backward compatibility in Design 006.
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Created implementation design index and dependency-aware handoff order. | GPT-5.6 Sol | Research 001-009 |
+
+* Footnotes and Glossary
+
+- *Design approval*: explicit maintainer authorization of a canonical design, independent of whether its file is merged.
+- *Parity closure*: final conformance pass proving the required capability matrix rather than assuming it from component completion.

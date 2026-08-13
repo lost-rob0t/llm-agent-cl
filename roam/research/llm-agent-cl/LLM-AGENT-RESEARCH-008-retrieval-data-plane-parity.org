@@ -1,0 +1,148 @@
+:PROPERTIES:
+:ID: llm-agent-research-008
+:END:
+#+title: Retrieval, embeddings, vector stores and document pipeline parity research
+#+description: Current LangChain retrieval/data-plane capabilities required in llm-agent-cl's first major parity milestone.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:research:retrieval:embeddings:vector-store:documents:rag:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| Retrieval research accuracy | Maintainer | PENDING | Review against current official docs | Sources below |
+| Inclusion in first major parity milestone | Maintainer | APPROVED | Explicit maintainer direction | 2026-08-12 review |
+| Implementation authorization | Maintainer | NOT STARTED | Approved retrieval design | Design 004 pending review |
+
+* Research conclusion
+
+Retrieval is not a later optional package family. Current LangChain treats documents, document loaders, text splitters, embedding models, vector stores and retrievers as first-class composable components. Its standard retrieval flow is modular: load documents, split them, embed chunks, store/search vectors, retrieve documents and feed those documents into a model or agent.
+
+The maintainer explicitly requires this capability class in the first major LangChain + LangGraph parity milestone.
+
+* Canonical document abstraction
+
+A document needs at minimum:
+
+- page/content text or typed content;
+- metadata map;
+- stable optional document id;
+- source/provenance metadata sufficient to trace loaded chunks back to origin.
+
+Loaders should produce documents rather than provider-specific payloads. Splitters should preserve or derive metadata and provenance when one source document becomes many chunks.
+
+* Document loader protocol
+
+Current LangChain loader semantics expose eager =load= and lazy/streaming loading. llm-agent-cl should provide equivalent sync/async and lazy behavior where the source supports it.
+
+First-major-milestone representative built-ins should include:
+
+- direct text/string loader;
+- local text/file loader;
+- JSON loader with caller-supplied extraction path/function;
+- CSV row/document loader;
+- HTML/text extraction loader;
+- HTTP textual loader using the common transport layer.
+
+Parity does not require cloning every third-party loader. It requires a stable loader protocol and enough representative implementations to validate composition.
+
+* Text splitting
+
+The first milestone should include:
+
+- character splitter;
+- recursive character splitter;
+- token-aware splitter through a tokenizer protocol;
+- extension hooks for structure-aware splitters.
+
+Splitters need explicit chunk-size/overlap semantics, deterministic ordering, metadata propagation and protection against non-progressing split loops.
+
+* Embedding model protocol
+
+Current LangChain distinguishes embedding queries and embedding documents. llm-agent-cl should expose:
+
+- embed one query;
+- embed one/many documents/texts;
+- bounded batch execution;
+- sync and async forms;
+- model/dimension metadata;
+- typed errors and cancellation;
+- optional cache wrapper keyed by model identity, embedding options and normalized input.
+
+OpenRouter now supplies the first remote embedding provider through its embeddings API. Its embeddings are complete responses rather than token streams. The core protocol must nevertheless remain provider-neutral.
+
+* Store and embedding cache protocols
+
+A generic byte/value store is useful for embedding caches, long-term memory and user extensions. Minimum operations should parallel the useful LangChain store shape:
+
+- multi-get;
+- multi-set;
+- multi-delete;
+- key iteration/prefix enumeration where the backend supports it.
+
+The first implementation should include an in-memory store with deterministic behavior. Persistent stores remain adapters.
+
+* Vector-store protocol
+
+The vector-store abstraction should support at least:
+
+- add/upsert documents with vectors or via an embedding model;
+- delete by id;
+- similarity search by text/query;
+- similarity search by vector;
+- scored search;
+- metadata filtering through a portable predicate/filter abstraction;
+- sync + async operations;
+- explicit distance/similarity metric metadata.
+
+An in-memory exact-search vector store is required as the reference implementation. It should support cosine similarity and a documented path for dot-product/Euclidean metrics. Approximate nearest-neighbor engines are integrations, not prerequisites for semantic parity.
+
+* Retriever protocol
+
+A retriever is more general than a vector store: it accepts a query and returns relevant documents. The protocol should therefore allow arbitrary implementations such as vector similarity, keyword/FTS, graph lookup, SQL or custom application logic.
+
+Retrievers need sync, async and bounded batch forms. They should be usable as ordinary callables, tools, agent dependencies or graph nodes without a separate hosted retrieval service.
+
+* RAG composition
+
+The first-major-milestone acceptance suite should prove a complete minimal RAG workflow:
+
+1. load documents;
+2. split documents;
+3. embed chunks;
+4. add chunks to an in-memory vector store;
+5. retrieve relevant chunks;
+6. format retrieved context into a model request;
+7. invoke a model/agent;
+8. preserve source metadata through the result path.
+
+Retrieval components should also be usable from an agent tool and from a graph node.
+
+* What parity does not mean
+
+It does not mean reproducing the literal count of LangChain community integrations. The parity requirement is satisfied by compatible capability classes, stable extension protocols, representative built-ins and tested composition.
+
+* Sources
+
+Retrieved 2026-08-12.
+
+- https://docs.langchain.com/oss/python/langchain/retrieval
+- https://docs.langchain.com/oss/python/integrations/document_loaders
+- https://docs.langchain.com/oss/python/integrations/splitters
+- https://docs.langchain.com/oss/python/integrations/embeddings
+- https://docs.langchain.com/oss/python/integrations/vectorstores
+- https://docs.langchain.com/oss/python/integrations/retrievers
+- https://docs.langchain.com/oss/python/integrations/stores
+- https://openrouter.ai/docs/api/reference/embeddings
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Added retrieval/data-plane parity research and first-major-milestone acceptance boundary. | GPT-5.6 Sol | Maintainer direction plus current LangChain/OpenRouter docs |
+
+* Footnotes and Glossary
+
+- *RAG*: retrieval-augmented generation.
+- *Exact search*: comparing a query vector against every stored vector rather than using an approximate index.
+- *Retriever*: query-to-document abstraction independent of the underlying search technology.

@@ -1,0 +1,231 @@
+:PROPERTIES:
+:ID: llm-agent-design-003
+:END:
+#+title: Agent and graph runtime design
+#+description: Proposed LangGraph-class state, reducers, supersteps, checkpoints, interrupts, time travel, tools and high-level agent runtime.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:design:agent:graph:checkpoint:interrupt:memory:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| Graph execution semantics | Maintainer | PENDING | Review reducers/supersteps/Send/Command | This design |
+| Persistence/interrupt semantics | Maintainer | PENDING | Review checkpoint/resume model | This design |
+| High-level agent construction | Maintainer | PENDING | Review model/tool graph | This design |
+| Implementation authorization | Maintainer | NOT STARTED | Explicit approval | None |
+
+* Systems
+
+Proposed systems:
+
+- =llm-agent/store= — long-term namespace/key store protocol + in-memory reference;
+- =llm-agent/checkpoint= — checkpointer protocol, snapshots, pending writes + in-memory reference;
+- =llm-agent/graph= — state schemas/reducers/nodes/edges/executor/commands/events;
+- =llm-agent/agent= — high-level model/tool agent assembled on graph primitives.
+
+* State schema
+
+A graph state schema defines named channels/keys and a reducer for each key. A reducer combines an existing value with one or more updates. Built-ins should include:
+
+- replace/last-value;
+- append sequence;
+- message-history append with tool/message identity handling;
+- numeric addition;
+- set union;
+- caller-supplied function.
+
+Reducers must declare or document algebraic expectations. Parallel writes to a non-commutative/non-associative reducer need deterministic ordering or an explicit conflict policy. Silent scheduler-dependent results are forbidden.
+
+* Nodes and edges
+
+A node receives state plus runtime context and returns one of:
+
+- state update map;
+- =command= combining update + route/resume intent;
+- sequence of =send= objects for dynamic fan-out;
+- interrupt request;
+- async/future result resolving to one of these.
+
+Edges may be static, conditional on state/result, or dynamic via =send=. Nodes are identified by stable names for checkpoints/traces/replay.
+
+* Superstep execution
+
+Use bulk-synchronous supersteps comparable to current LangGraph semantics:
+
+1. determine runnable tasks from committed state/routes;
+2. snapshot each task's input;
+3. execute independent tasks concurrently up to executor limit;
+4. collect successful writes and routing intents;
+5. persist pending task writes if checkpointer supports fault recovery;
+6. if required tasks fail, do not commit a partial new graph state;
+7. on successful barrier, reduce writes deterministically and commit one new checkpoint/state version;
+8. schedule the next superstep.
+
+Parallelism is bounded by the explicit executor. One failed task does not require rerunning already-successful sibling tasks after resume if their pending writes were durably stored.
+
+* Send
+
+A =send= carries a destination node plus task-local input/state overlay. It enables dynamic map/fan-out from one graph state. Fan-out task identity must be stable enough for checkpoint/pending-write recovery. Results merge only through declared state reducers.
+
+* Command
+
+A =command= may:
+
+- update graph state;
+- route to one or more destinations;
+- resume an interrupt with a supplied value;
+- target parent graph routing where subgraph rules allow it.
+
+This prevents awkward separation between “return update” and “decide next edge” for agentic nodes.
+
+* Checkpoint model
+
+A checkpoint record contains at least:
+
+- thread/execution id;
+- namespace/subgraph path;
+- checkpoint id/version;
+- parent checkpoint id;
+- committed state values;
+- next/runnable task descriptors;
+- task metadata/errors/interrupts;
+- channel/version metadata sufficient for conflict detection;
+- created timestamp and custom metadata.
+
+The checkpointer protocol supports load latest, load by id, list history, write checkpoint and write/read pending task contributions. In-memory checkpointer is the first implementation; persistent adapters follow the same protocol.
+
+* Thread identity and multi-turn memory
+
+A high-level conversation can bind to a graph thread id. With a checkpointer, message state survives separate invocations. Without one, state remains caller-owned/in-memory for that run.
+
+Thread ids and checkpoint ids are caller-visible data, never implicit process globals.
+
+* Interrupt and resume
+
+A node may produce an interrupt payload at a deterministic point. The runtime persists checkpoint/task state before returning control. Public result includes interrupt id/payload and thread/checkpoint identity.
+
+Resume supplies one or more values through a =command= or resume API. Re-execution semantics must be documented: code before an interrupt may execute again after resume, so users are warned to place non-idempotent side effects behind idempotency/transaction boundaries or after the resume point.
+
+* Time travel
+
+Support:
+
+- inspect checkpoint history;
+- replay from an earlier checkpoint with unchanged state;
+- fork from an earlier checkpoint with state updates;
+- continue fork under a new lineage/checkpoint id.
+
+Replaying a prior state must not mutate the original historical checkpoint.
+
+* Subgraphs
+
+A compiled graph may be invoked as a node. Support:
+
+- shared state keys mapped to parent channels;
+- isolated child state with explicit input/output mapping;
+- checkpoint namespaces identifying parent/child path;
+- configurable child persistence semantics.
+
+Subgraph recursion and execution depth are bounded.
+
+* Long-term store
+
+Separate long-term store from graph checkpointer. Store protocol uses namespace + key and supports get/put/delete/search/list operations, with batch variants where useful. An in-memory implementation is required.
+
+Runtime context exposes the store to tools/nodes. Long-term memory is application/user data, not magically injected into prompts; agent middleware/tools choose how to retrieve/use it.
+
+* Event streaming
+
+Every graph run exposes typed events. Modes/projections should cover:
+
+- graph output values/state deltas;
+- task/node start/end/error;
+- model message/token events forwarded from provider streams;
+- tool start/result/error;
+- checkpoints;
+- interrupts;
+- custom node events;
+- debug/all-events mode.
+
+Event order is defined per task and superstep; parallel task interleaving across tasks is allowed but each event carries task/node/superstep identity.
+
+* Tools
+
+Tool definition contains name, description, JSON Schema input, optional output schema, callable and metadata/policy. Tool execution:
+
+- validates arguments before call;
+- preserves call id;
+- runs parallel independent calls within bounded executor policy;
+- observes cancellation/deadline;
+- supports sync/async callables through adapter protocol;
+- returns typed tool result/error content;
+- never lets model-originated data select arbitrary Lisp functions outside the registry.
+
+* High-level agent
+
+=make-agent= is convenience built on the graph runtime, not a separate hidden loop. Canonical graph shape:
+
+1. model node builds prompt/messages from state/context and invokes selected model;
+2. if no tool calls, route to finish;
+3. if tool calls, fan out or run tool node(s) according to policy;
+4. append correlated tool results through message reducer;
+5. route back to model;
+6. enforce iteration/model/tool/cost/token/deadline budgets;
+7. structured-output finalizer/validator where configured.
+
+Middleware may alter prompt/model selection/tool policy, but graph state/checkpoint semantics remain visible.
+
+* Runtime limits
+
+Configurable hard limits:
+
+- recursion/supersteps;
+- model calls;
+- tool calls and parallel tools;
+- spawned dynamic tasks;
+- event buffer sizes;
+- elapsed deadline;
+- token/cost budget where usage/pricing is available;
+- checkpoint/state serialized size.
+
+Limit exhaustion produces typed terminal conditions/events and a final checkpoint where safe.
+
+* Determinism boundary
+
+External model/tool calls are inherently nondeterministic, but graph mechanics are deterministic given task results. Reducer order, checkpoint lineage, task ids and routing behavior must not depend on hash iteration/thread scheduling.
+
+* Tests
+
+Required deterministic tests include:
+
+- reducers and conflicting parallel writes;
+- conditional routes, =send= and =command=;
+- bounded parallel supersteps;
+- task failure with pending-write recovery;
+- interrupt/resume and side-effect-safe examples;
+- subgraph state mapping;
+- checkpoint history/replay/fork;
+- long-term store access;
+- streaming event ordering/identity;
+- agent single tool, parallel tools, tool errors, structured output;
+- recursion/budget/deadline cancellation;
+- checkpoint corruption/version mismatch behavior.
+
+* Related research/design
+
+- [[id:llm-agent-research-001][Parity research]]
+- [[id:llm-agent-design-001][Core contracts]]
+- [[id:llm-agent-design-002][Provider/streaming]]
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Created graph/state/checkpoint/interrupt/time-travel and high-level agent design. | GPT-5.6 Sol | Current LangGraph/LangChain research |
+
+* Footnotes and Glossary
+
+- *Superstep*: barrier-delimited set of graph tasks that read committed state and commit combined writes together.
+- *Reducer*: function/policy combining multiple state updates for a channel.
+- *Pending write*: successful task contribution persisted before its superstep fully commits.

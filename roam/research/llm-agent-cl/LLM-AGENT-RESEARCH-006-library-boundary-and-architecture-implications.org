@@ -2,57 +2,83 @@
 :ID: llm-agent-research-006
 :END:
 #+title: Library boundary and architecture implications
-#+description: Research conclusions that constrain later llm-agent-cl architecture without authorizing implementation.
+#+description: Research conclusions constraining llm-agent-cl as an embeddable Common Lisp library while permitting intentional quick-test defaults.
 #+status: DRAFT
-#+filetags: :llm-agent-cl:research:architecture:boundaries:
+#+filetags: :llm-agent-cl:research:architecture:boundaries:configuration:
 
 * Approval Table
 
 | Approval area | Required authority | State | Evidence required | Evidence reference |
 |---------------+--------------------+-------+-------------------+--------------------|
-| Boundary conclusions | Maintainer | PENDING | Maintainer review | Sibling research notes |
-| Architecture direction | Maintainer | PENDING | Approved future design | None yet |
-| Implementation authorization | Maintainer | NOT STARTED | Approved design | None |
+| Library boundary | Maintainer | PENDING | Maintainer review | Sibling research notes |
+| Quick-test/global convenience direction | Maintainer | APPROVED | Explicit maintainer review | 2026-08-12 |
+| Retrieval in first major milestone | Maintainer | APPROVED | Explicit maintainer review | 2026-08-12 |
+| Implementation authorization | Maintainer | NOT STARTED | Approved designs | Design set pending review |
 
 * Boundary conclusion
 
-The project should be a layered embeddable library. It should not own a daemon, web UI, agent hosting service, global database, StarIntel actor runtime, or mandatory scheduler. Applications compose those around the library.
+The project is a layered embeddable library. It does not own a daemon, web UI, hosted agent service, global database, StarIntel actor runtime, or mandatory scheduler. Applications compose those around the library.
+
+This boundary does **not** prohibit ergonomic process-wide defaults. The distinction is between an embeddable core whose dependencies/configuration can always be explicit, and optional convenience state intentionally configured by an end user for REPLs, examples or quick tests.
 
 * Layers implied by research
 
-These are dependency directions for a future design, not implementation package names:
+These are dependency directions reflected in the accompanying designs:
 
-1. **Canonical values and errors** — messages, content blocks, usage, tool calls/results, stream events, conditions.
-2. **Execution primitives** — cancellation, deadlines, sync/async result semantics, middleware/event hooks.
-3. **HTTP transports** — Dexador sync plus a production async backend conforming to the same contract; Carrier is the native Common Lisp reference implementation, with hardening or libcurl-multi replacement required before production.
-4. **Provider contracts/adapters** — OpenRouter first; provider capabilities and extensions isolated here.
-5. **Tool + structured-output layer** — schema validation, execution, result correlation.
-6. **High-level agent loop** — repeated model/tool turns, budgets/limits, multi-turn state.
-7. **Low-level graph/state layer** — deterministic/agentic nodes, routing, checkpoints, interrupts, subgraphs, parallelism.
-8. **MCP adapters** — translate MCP tools/resources/prompts through existing canonical contracts.
-9. **Optional integrations** — persistence backends, tracing exporters, retrieval/vector systems, application adapters.
+1. **Canonical values and errors** — messages, content blocks, usage, tool calls/results, documents, embeddings, stream events and conditions.
+2. **Execution primitives** — cancellation, deadlines, future/result semantics, bounded channels, middleware/event hooks.
+3. **Configuration/runtime context** — explicit client/runtime config plus scoped/process convenience defaults.
+4. **HTTP transports** — Dexador sync and maintained =lost-rob0t/carrier= async adapters.
+5. **Provider contracts/adapters** — OpenRouter first; provider capabilities/extensions isolated here.
+6. **Tool + structured-output layer** — JSON Schema validation, execution, result correlation.
+7. **Graph/state runtime** — reducers, nodes/edges, Send/Command, supersteps, checkpoints, interrupts, subgraphs, time travel.
+8. **High-level agent layer** — model/tool loop built on graph primitives.
+9. **Retrieval/data plane** — documents, loaders, splitters, embeddings, stores, vector stores and retrievers; first-major-milestone core package family.
+10. **MCP adapters** — tools/resources/prompts through canonical contracts.
+11. **Optional integrations** — persistent checkpointers/stores, tracing exporters and application-specific adapters.
 
-* Why the graph/state layer belongs in the library
+* Why graph/state must precede high-level agent convenience
 
-LangChain currently builds its high-level agents on LangGraph and gains persistence, durable execution, and HITL from that lower layer. If =llm-agent-cl= implements only a recursive tool loop first and treats explicit state/checkpointing as an application concern, later parity would require breaking core execution semantics. Therefore state transitions, cancellation, event streaming, and resumability need to be designed before implementation even when the first milestone uses in-memory state.
+LangChain currently builds its high-level agent behavior on LangGraph. Persistence, interrupts, memory, streaming and time travel all rely on explicit state transitions. Implementing a recursive model/tool loop first and attempting to retrofit checkpoint semantics later would force breaking changes. The designs therefore put the graph/state execution contract under the high-level agent API from the first implementation sequence.
+
+* Why retrieval is not optional later work
+
+Current LangChain treats document processing, embeddings, retrievers and vector stores as first-class component categories and its retrieval pipeline composes them directly. The maintainer explicitly requires these in the first major parity milestone. They can live in separate ASDF systems/packages so lightweight consumers do not load every integration, but the release milestone is not complete without them.
 
 * Provider independence rule
 
-OpenRouter is the first provider, not the canonical wire model. OpenAI-compatible JSON is useful adapter input/output but cannot define the full core because other providers expose different reasoning, multimodal, tool, cache, citation, and metadata structures. Unknown provider-native data needs a deliberate extension escape hatch.
+OpenRouter is the first provider, not the canonical wire model. OpenAI-compatible JSON is useful adapter input/output but cannot define the core because providers vary in reasoning, multimodal, tools, caching, citations, routing and metadata. Unknown provider-native data needs an explicit extension map.
 
-* No hidden global state
+* Explicit core plus intentional defaults
 
-Provider credentials, default models, tool registries, conversation state, checkpoint stores, middleware stacks, and transport clients should be explicit values/configuration supplied by callers. Thread-local/dynamic conveniences may exist later, but the core contract must remain testable and embeddable.
+The previous “No hidden global state” language was too absolute. The approved model is:
 
-* First future design prerequisites
+- core constructors and operations accept explicit configuration;
+- runtime/context objects carry caller-owned dependencies and state;
+- dynamic special variables provide scoped defaults for REPL/tests;
+- a small process-wide default registry/configuration object may be intentionally mutated by callers;
+- environment variables can provide provider-standard convenience defaults;
+- explicit values always have higher precedence than defaults;
+- defaults are inspectable/resettable and tests can run with a fresh default context;
+- secrets are redacted and never serialized implicitly.
 
-Before writing Common Lisp runtime code:
+Conversation state, checkpoint state and tool side effects must not silently fall back to unrelated process-global state. Convenience globals are for defaults/configuration, not hidden execution history.
 
-- maintainer approves the research scope;
-- async transport design selects either a hardened Carrier path or a libcurl-multi client and defines verified TLS/cancellation/reuse semantics;
-- OpenRouter structured-output/capability field research is completed;
-- a design defines canonical values/errors and sync/async semantics;
-- dependency choices for JSON + JSON Schema + concurrency primitives are researched for license/maintenance/portability.
+* Maintained Carrier boundary
+
+The production async dependency is =lost-rob0t/carrier=. Carrier remains a standalone HTTP library; llm-agent-cl must not inject provider, agent or StarIntel concepts into it. The fork hardening design is maintained in this auto-research repository and must be approved before changes land in Carrier.
+
+* Dependency conclusions
+
+The dependency research selects:
+
+- =com.inuoe.jzon= as the JSON parser/writer candidate;
+- =cl-jschema= behind a project-owned validator protocol, with conformance gaps tested before production claims;
+- =bordeaux-threads= for portable locks/condition primitives;
+- =lparallel= for bounded worker pools, parallel tools/graph branches and future-like task execution;
+- Blackbird remains internal to Carrier adaptation rather than becoming llm-agent-cl's public async type.
+
+See research 009 for constraints and caveats.
 
 * Related research
 
@@ -62,15 +88,19 @@ Before writing Common Lisp runtime code:
 - [[id:llm-agent-research-004][MCP]]
 - [[id:llm-agent-research-005][Production readiness]]
 - [[id:llm-agent-research-007][Carrier async HTTP evaluation]]
+- [[id:llm-agent-research-008][Retrieval/data-plane parity]]
+- [[id:llm-agent-research-009][Common Lisp dependency and portability choices]]
 
 * Changelog
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
-| 2026-08-12 | Replaced unresolved async-library prerequisite with Carrier/libcurl production transport decision and explicit transport-client ownership boundary. | GPT-5.6 Sol | Research 003/007 |
-| 2026-08-12 | Synthesized research into library-boundary and dependency-direction constraints. | GPT-5.6 Sol | Sibling research notes 001-005 |
+| 2026-08-12 | Replaced blanket global-state prohibition with explicit-core + intentional default configuration model and moved retrieval into first major milestone. | GPT-5.6 Sol | Explicit maintainer direction plus current LangChain architecture |
+| 2026-08-12 | Replaced unresolved async-library prerequisite with Carrier production transport research. | GPT-5.6 Sol | Research 003/007 |
+| 2026-08-12 | Synthesized initial library-boundary constraints. | GPT-5.6 Sol | Sibling research notes |
 
 * Footnotes and Glossary
 
 - *Embedding*: using the library inside another application/process rather than requiring an external service.
-- *Extension escape hatch*: explicit storage for provider-native fields that canonical types do not standardize.
+- *Extension map*: explicit storage for provider-native fields not standardized by canonical types.
+- *Intentional default*: caller-configured convenience state with documented precedence and reset behavior.

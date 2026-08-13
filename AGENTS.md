@@ -22,9 +22,11 @@ find .. -name AGENTS.md -print
 
 `llm-agent-cl` is a reusable Common Lisp **library**, not an agent hosting service, daemon, SaaS harness, StarIntel subsystem, or application-specific runtime.
 
-The eventual library must support multi-provider LLM access and composable agent behavior with production-grade contracts comparable in capability to LangChain + LangGraph. StarIntel may depend on this library later, but StarIntel-specific APIs, persistence, actor runtime, policies, schemas, and deployment assumptions must not leak into the core library.
+The library must reach behavioral feature parity with the current LangChain + LangGraph capability classes, including the retrieval/data plane: document abstractions, document loaders, text splitters, embedding models, vector stores, retrievers, key/value stores and embedding caches. Those capabilities are part of the first major parity milestone and MUST NOT be deferred merely because the initial OpenRouter/agent path can run without them.
 
-Current phase: **deep research only**. Do not add runtime Common Lisp source, ASDF systems, provider implementations, HTTP adapters, MCP implementations, or agent execution code until research is reviewed and an implementation design is explicitly approved.
+StarIntel may depend on this library later, but StarIntel-specific APIs, persistence, actor runtime, policies, schemas, and deployment assumptions must not leak into the core library.
+
+Current phase: **research and design only**. Canonical design documents may be created and revised, but do not add runtime Common Lisp source, ASDF runtime systems, provider implementations, HTTP adapters, MCP implementations, Carrier changes, or agent execution code until the applicable design documents are explicitly approved by the maintainer.
 
 License: MIT.
 
@@ -54,11 +56,11 @@ Each immediate `roam/implement/<project>/` directory may contain zero or one act
 
 ## Research contracts
 
-Use current primary sources for changing external facts and record retrieval dates. Distinguish verified facts, recommendations, assumptions, contradictions, and unresolved questions.
+Use current primary sources for changing external facts and record retrieval dates. Distinguish verified facts, recommendations, maintainer decisions, assumptions, contradictions, and unresolved questions.
 
-For provider/API research record: endpoint, authentication, request fields, response fields, tool behavior, structured output, streaming framing, usage accounting, model capability discovery, cancellation, timeout/deadline behavior, retries, rate limits, error envelopes, idempotency/ambiguous submission behavior, privacy/logging, and test requirements.
+For provider/API research record: endpoint, authentication, request fields, response fields, tool behavior, structured output, streaming framing, usage accounting, model capability discovery, embeddings where available, cancellation, timeout/deadline behavior, retries, rate limits, error envelopes, idempotency/ambiguous submission behavior, privacy/logging, and test requirements.
 
-For framework parity research record both high-level LangChain-style and low-level LangGraph-style capabilities. Feature parity is behavioral parity, not Python API cloning.
+For framework parity research record both high-level LangChain-style and low-level LangGraph-style capabilities. Feature parity is behavioral parity, not Python API cloning and not literal parity with every third-party integration package.
 
 ## Required architecture invariants for future designs
 
@@ -71,25 +73,48 @@ For framework parity research record both high-level LangChain-style and low-lev
 - Multi-turn state is explicit and caller-owned unless a pluggable checkpoint store is supplied.
 - Middleware/interceptors can observe and transform model calls, tools, state transitions, retries, limits, and errors.
 - Agent loops and graph execution are library abstractions; no hosted control plane is required.
+- Graph parity includes state reducers, dynamic sends, command/update routing, parallel supersteps, checkpoints, pending writes, interrupts/resume, subgraphs, replay/fork time travel, short-term memory, long-term stores, and typed event streams.
+- Retrieval parity includes documents, loaders, splitters, embeddings, vector stores, retrievers and caching/store protocols in the first major milestone.
 - Cancellation, deadlines, bounded retries, backpressure, and partial-stream failures are explicit.
 - Secrets never enter logs, fixtures, research notes, ledgers, or generated artifacts.
 - MCP support follows the current protocol specification and keeps stdio/HTTP transports pluggable.
+
+## Configuration and REPL convenience
+
+The production core must remain explicit and testable, but end users MUST also have convenient quick-testing configuration.
+
+Approved direction:
+
+- explicit per-call values override everything;
+- explicit client/provider configuration is the normal production path;
+- scoped dynamic defaults are supported for REPL/tests;
+- process-wide convenience defaults may be set intentionally by the caller;
+- provider-standard environment variables such as `OPENROUTER_API_KEY` may be used as a convenience fallback;
+- there is never a hard-coded credential in the library;
+- resolved secrets must be redacted from printing, logs, traces and conditions.
+
+Global convenience state is therefore allowed; hidden, unavoidable global state is not.
 
 ## HTTP requirement
 
 Dexador is the required synchronous HTTP library.
 
-Carrier (`orthecreedence/carrier`) is the identified native asynchronous Common Lisp HTTP client and the reference implementation for async transport research. It is MIT-licensed, built on `cl-async` + `fast-http`, returns Blackbird promises, supports response body chunk callbacks, redirects, cookies, timeouts, and HTTPS through `cl-async-ssl`.
+`lost-rob0t/carrier` is the canonical maintained asynchronous HTTP fork for this project. It is currently a direct fork of `orthecreedence/carrier`, which is MIT-licensed, built on `cl-async` + `fast-http`, returns Blackbird promises, and supports incremental response-body callbacks suitable for SSE.
 
-Stock Carrier MUST NOT be treated as production-approved without remediation. Current upstream evidence shows:
+Stock Carrier MUST NOT be used for production provider traffic unchanged. The maintained fork must fix, at minimum:
 
-- `cl-async-ssl` configures client verification with `SSL_VERIFY_NONE`; certificate/hostname verification is therefore not acceptable for production provider traffic.
-- Carrier does not expose a first-class request cancellation handle; the socket is internal to `request`.
-- Carrier closes the socket after each completed response, so connection pooling/reuse is absent.
-- request-body streaming is not implemented upstream.
-- upstream issues document SSL compatibility and TLS-context reuse/performance gaps.
+- verified TLS certificate chains and hostname validation, fail-closed;
+- first-class cancellable request handles;
+- deterministic deadline/timeout behavior;
+- connection and TLS-context reuse;
+- correct octet/binary request serialization and streaming upload support;
+- redirect credential stripping and origin-safe redirect behavior;
+- proxy behavior or explicit unsupported errors;
+- deterministic conformance, TLS, race, malformed-response and lifecycle tests.
 
-Future designs must preserve the async transport behind a library interface. The preferred order is: (1) evaluate a hardened Carrier fork/adapter with verified TLS, cancellation and connection reuse; (2) if that cannot satisfy the contract cleanly, implement a small Common Lisp async client over libcurl's multi interface. Do not weaken TLS verification to retain Carrier compatibility.
+The earlier libcurl-multi option is no longer the active design direction. It remains historical contingency research only; changing away from the maintained Carrier fork requires a new explicit maintainer decision.
+
+Do not modify `lost-rob0t/carrier` until the Carrier hardening design in this repository is approved.
 
 ## Substantive Org documents
 
@@ -135,4 +160,4 @@ git status --short
 git diff --name-only
 ```
 
-Do not claim commands ran unless observed. Do not enable auto-merge. Merge only after required checks for the exact current head are green and review requirements are satisfied.
+Do not claim commands ran unless observed. Do not enable auto-merge. Merge only after required checks for the exact current head are green and review requirements are satisfied. Merging research/design documents does not authorize implementation.

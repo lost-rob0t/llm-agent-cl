@@ -2,106 +2,151 @@
 :ID: llm-agent-research-001
 :END:
 #+title: LangChain and LangGraph feature parity research
-#+description: Behavioral capability baseline for a Common Lisp agent library comparable to LangChain and LangGraph.
+#+description: Behavioral capability baseline for a Common Lisp agent library with mandatory LangChain and LangGraph class parity.
 #+status: DRAFT
-#+filetags: :llm-agent-cl:research:langchain:langgraph:parity:
+#+filetags: :llm-agent-cl:research:langchain:langgraph:parity:retrieval:
 
 * Approval Table
 
 | Approval area | Required authority | State | Evidence required | Evidence reference |
 |---------------+--------------------+-------+-------------------+--------------------|
 | Research accuracy | Maintainer | PENDING | Review against current official docs | Sources below |
-| Parity scope | Maintainer | PENDING | Explicit scope approval | None yet |
-| Implementation authorization | Maintainer | NOT STARTED | Approved design | None |
+| LangChain + LangGraph parity scope | Maintainer | APPROVED | Explicit maintainer direction | 2026-08-12 review: parity is required |
+| Retrieval/data-plane inclusion in first major milestone | Maintainer | APPROVED | Explicit maintainer direction | 2026-08-12 review |
+| Implementation authorization | Maintainer | NOT STARTED | Approved designs | Design set pending review |
 
 * Research question
 
-What behavioral capabilities must =llm-agent-cl= expose to be credibly comparable to current LangChain + LangGraph while remaining a reusable Common Lisp library rather than a hosted agent harness?
+What behavioral capabilities must =llm-agent-cl= expose to reach credible LangChain + LangGraph feature parity while remaining a reusable Common Lisp library rather than a hosted agent harness?
 
-The user wording “langchain and language” is interpreted as *LangChain and LangGraph* because the requested feature set includes both a LangChain-like model/agent layer and LangGraph-like stateful orchestration. This interpretation remains reviewable.
+The maintainer has explicitly resolved the earlier ambiguity: LangChain + LangGraph parity is required, and embeddings/vector stores/document loaders must be included in the first major parity milestone rather than left for an indefinite later package family.
 
 * Verified baseline
 
-Current LangChain presents a standard model interface across providers and a configurable agent abstraction built from models, tools, prompts, and middleware. Its model layer supports normal invocation, streaming, tool calling, structured output, multimodal content, usage metadata, and conversation messages. LangChain agents maintain message state, execute tool loops, expose middleware, and inherit LangGraph capabilities.
+Current LangChain provides standard provider-neutral model interfaces, messages/content blocks, standalone and agent model invocation, streaming, tool calling, structured output, multimodality, reasoning metadata, model profiles/capability data, middleware, runtime context, short-term/long-term memory integration, retrieval components, and a broad integration ecosystem.
 
-Current LangGraph is the lower-level orchestration layer for long-running, stateful agents. Its documented capability classes include durable execution, persistence/checkpoints, human-in-the-loop interrupts, memory, streaming, deterministic + agentic graph composition, and subgraphs.
+Current LangGraph is the lower-level stateful orchestration layer. Current documented capabilities include explicit graph state and reducers, nodes/edges, conditional routing, dynamic =Send= fan-out, =Command= state-update plus routing/resume semantics, parallel supersteps, persistence/checkpoints, pending writes for fault tolerance, interrupts/resume, subgraphs, short-term memory, long-term stores, streaming, typed event projections, replay/fork time travel, and both graph and functional APIs.
+
+LangChain's current component architecture also treats embedding models, retrievers, document processing, and vector stores as first-class component categories. Its retrieval pipeline explicitly composes document loaders -> text splitters -> embedding models -> vector stores -> retrievers -> generation. Therefore omitting these from the first major parity milestone would not satisfy the maintainer's parity requirement.
 
 * Feature parity matrix
 
-| Capability class | Required parity target | Core library? | Notes |
-|------------------+------------------------+---------------+-------|
+| Capability class | Required parity target | First major milestone? | Notes |
+|------------------+------------------------+------------------------+-------|
 | Provider-neutral chat models | YES | YES | Provider selection must not change caller message model. |
 | Canonical messages/content blocks | YES | YES | System/user/assistant/tool plus multimodal/extensible blocks. |
-| Sync invocation | YES | YES | First-class; Dexador-backed for OpenRouter initially. |
-| Async invocation | YES | YES | Same semantics as sync; Carrier is the reference async client, with production hardening required. |
-| Token/content streaming | YES | YES | Typed events, not callback-only strings. |
-| Agent-step/state streaming | YES | YES | Expose model/tool/state progress separately. |
-| Tool calling | YES | YES | Multiple/parallel calls, IDs, schemas, typed errors. |
-| Structured output | YES | YES | Provider-native strategy plus tool-mediated fallback. |
-| Multi-turn conversation | YES | YES | Explicit caller-owned state by default. |
-| Middleware/interceptors | YES | YES | Model, tool, state, retry, policy and observability hooks. |
-| Retries/fallbacks | YES | YES | Bounded and typed; no unsafe retry after ambiguous side effects. |
+| Sync invocation | YES | YES | First-class; Dexador-backed provider path initially. |
+| Async invocation | YES | YES | Same semantics as sync; maintained =lost-rob0t/carrier= backend. |
+| Batch invocation | YES | YES | Sync/async batch with bounded concurrency. |
+| Token/content streaming | YES | YES | Typed events, reasoning/tool/usage deltas included. |
+| Agent-step/state streaming | YES | YES | Messages, tools, state, tasks, checkpoints, custom events and output. |
+| Tool calling | YES | YES | Multiple/parallel calls, IDs, JSON Schema, typed errors/results. |
+| Structured output | YES | YES | Provider-native JSON Schema plus tool-mediated fallback. |
+| Multi-turn conversation | YES | YES | Explicit state with optional checkpointer. |
+| Middleware/interceptors | YES | YES | Model, tool, state, retry, policy, prompt and observability hooks. |
+| Runtime context | YES | YES | Invocation-scoped dependencies/context/store/writer. |
+| Retries/fallbacks | YES | YES | Bounded and typed; no unsafe replay after ambiguous side effects. |
 | Dynamic model routing | YES | YES | Capability-aware model/provider selection. |
-| Multimodal input/output | YES | YES | Canonical content blocks with provider fallbacks. |
-| Batch model calls | YES | YES | Semantic parity target; transport/provider may optimize later. |
+| Model capability/profile data | YES | YES | Context limits, modalities, tools, structured output, reasoning, etc. |
+| Multimodal input/output | YES | YES | Canonical content blocks with provider fallbacks/extensions. |
+| Prompt/template abstraction | YES | YES | Message/text templates and runtime prompt middleware. |
 | Checkpoint abstraction | YES | YES | Storage-neutral interface. |
-| Durable resume | YES | YES | Requires pluggable checkpoint store; no mandatory database. |
-| Interrupt/HITL | YES | YES | Serializable interrupt payload + resume token/state. |
-| Graph/state machine API | YES | YES | Low-level deterministic + agentic nodes/edges. |
-| Subgraphs | YES | YES | Isolated or persistent state modes. |
-| Parallel branches | YES | YES | Deterministic merge semantics required. |
-| Memory | YES | YES | Short-term state + optional long-term store contracts. |
-| MCP | YES | YES | Shared canonical tool/content contracts. |
-| Observability hooks | YES | YES | Library events/traces; no required hosted backend. |
-| Hosted tracing/service | NO | NO | Integrations may be added, but library cannot require a control plane. |
-| Every third-party LangChain integration | NO literal count parity | EXTENSION | Parity means open adapter contracts, not cloning thousands of integrations. |
+| Durable resume | YES | YES | Pluggable checkpointer; no mandatory database. |
+| Pending writes/fault recovery | YES | YES | Preserve successful parallel task writes across failed supersteps. |
+| Interrupt/HITL | YES | YES | Serializable interrupt payload + resume command/state. |
+| Graph/state machine API | YES | YES | State schemas, nodes, edges, reducers, conditional routing. |
+| Dynamic send/map-reduce | YES | YES | Fan-out inputs with deterministic merge. |
+| Command/update routing | YES | YES | One result can update state and select next route/resume. |
+| Subgraphs | YES | YES | Parent/child state and checkpoint modes. |
+| Parallel branches/supersteps | YES | YES | Bounded execution and deterministic reducers. |
+| Replay/fork time travel | YES | YES | Resume from checkpoints and branch modified state. |
+| Short-term memory | YES | YES | Thread/conversation state via checkpointer. |
+| Long-term store | YES | YES | Namespace/key store available to runtime/tools. |
+| Document abstraction | YES | YES | Content + metadata + stable identity/provenance. |
+| Document loaders | YES | YES | =load= and lazy/streaming load protocol plus useful built-ins. |
+| Text splitters | YES | YES | Character/recursive/token-aware and structure-aware extension protocol. |
+| Embedding model abstraction | YES | YES | Query/document/batch embeddings; OpenRouter first remote embedding adapter. |
+| Embedding cache | YES | YES | Store-backed cache wrapper with namespace/model identity. |
+| Vector-store abstraction | YES | YES | Add/delete/search/filter/search-by-vector/score; sync + async. |
+| In-memory vector store | YES | YES | Deterministic reference implementation for tests/dev. |
+| Retriever abstraction | YES | YES | Query -> documents; vector and arbitrary-source retrievers. |
+| RAG composition | YES | YES | Retrieval components compose with models/agents/graphs without special harness. |
+| MCP client adapters | YES | YES | MCP tools/resources/prompts map onto canonical contracts. |
+| MCP server export | YES | YES, after client slice | Same major milestone; client is dependency-first. |
+| Observability hooks | YES | YES | Structured events/traces; no required hosted backend. |
+| Hosted tracing/service | NO | NO | Optional integration only. |
+| Every third-party LangChain integration | NO literal count parity | NO | Parity means stable interfaces + representative adapters, not cloning 1000+ packages. |
 
-* Design implications discovered by research
+* Design implications
 
-1. The public core should be layered: canonical values/errors -> model/provider contracts -> tools/structured output -> agent loop -> graph/checkpoint layer -> MCP adapters.
-2. The high-level agent API must be implementable on top of the lower-level state/graph primitives, matching the LangChain-over-LangGraph relationship without copying Python object models.
-3. Sync and async are not separate feature sets. They require one semantic contract and different transport/execution bindings.
-4. Streaming must cover both provider token deltas and orchestration events.
-5. Persistence is optional at construction time but its interfaces are core; durable behavior cannot be retrofitted cleanly if state transitions are not explicit from the start.
+1. The public library must be layered around canonical values and protocols, with provider/transport details at the boundary.
+2. The high-level agent must be implemented on the graph/state execution layer so checkpointing, interrupts and streaming are not retrofits.
+3. Sync/async are one semantic contract with separate execution/transport adapters.
+4. Event streaming must represent provider deltas and orchestration events through a common typed stream.
+5. Persistence is optional to construct but checkpoint/store protocols are core.
+6. Retrieval is a first-major-milestone package family, not an optional someday integration.
+7. The standard interfaces are the parity boundary. Third-party integration count is explicitly not the parity metric.
+
+* First-major-milestone acceptance boundary
+
+The milestone cannot be called LangChain + LangGraph parity-complete until automated conformance tests exercise at least:
+
+- chat sync/async/batch/stream;
+- tools + structured output + middleware;
+- multi-turn/checkpoint/interrupt/resume;
+- graph reducers/conditional routing/Send/Command/parallel branches/subgraphs;
+- checkpoint replay/fork and pending-write recovery;
+- documents/loaders/splitters;
+- embeddings + caching;
+- vector store + retriever + a complete minimal RAG workflow;
+- MCP client and server adapter basics;
+- typed event streaming across model/tool/graph/retrieval operations.
 
 * Non-goals
 
 - No hosted agent server.
 - No StarIntel-specific actor, database, or schema dependency.
 - No exact Python API clone.
-- No claim that a finite initial provider list equals the entire LangChain integration ecosystem.
+- No requirement to reproduce every LangChain third-party integration package before a 1.0 release.
 
 * Sources
 
 Retrieved 2026-08-12.
 
-- https://docs.langchain.com/oss/python/langchain/overview
+- https://docs.langchain.com/oss/python/langchain/component-architecture
 - https://docs.langchain.com/oss/python/langchain/models
-- https://docs.langchain.com/oss/python/langchain/messages
 - https://docs.langchain.com/oss/python/langchain/agents
+- https://docs.langchain.com/oss/python/langchain/runtime
 - https://docs.langchain.com/oss/python/langchain/streaming
-- https://docs.langchain.com/oss/python/langchain/middleware/overview
-- https://docs.langchain.com/oss/python/langchain/structured-output
-- https://docs.langchain.com/oss/python/langgraph/overview
+- https://docs.langchain.com/oss/python/langchain/retrieval
+- https://docs.langchain.com/oss/python/integrations/document_loaders
+- https://docs.langchain.com/oss/python/integrations/splitters
+- https://docs.langchain.com/oss/python/integrations/embeddings
+- https://docs.langchain.com/oss/python/integrations/vectorstores
+- https://docs.langchain.com/oss/python/integrations/retrievers
+- https://docs.langchain.com/oss/python/integrations/stores
+- https://docs.langchain.com/oss/python/langgraph/graph-api
 - https://docs.langchain.com/oss/python/langgraph/persistence
-- https://docs.langchain.com/oss/python/langgraph/interrupts
-- https://docs.langchain.com/oss/python/langgraph/use-subgraphs
+- https://docs.langchain.com/oss/python/langgraph/add-memory
+- https://docs.langchain.com/oss/python/langgraph/streaming
+- https://docs.langchain.com/oss/python/langgraph/use-time-travel
 
-* Unresolved questions
+* Resolved questions
 
-- Whether embeddings/vector stores/document loaders belong in the first major parity milestone or a later package family.
-- Exact public Common Lisp idioms for async values and graph state should be chosen only after dependency and portability research.
-- Whether the production async transport is hardened Carrier or a small libcurl-multi client; see research 003 and 007.
+- Embeddings, vector stores, retrievers, stores, document loaders and text splitters are in the first major parity milestone by explicit maintainer direction.
+- The production async client direction is the maintained =lost-rob0t/carrier= fork; see research 003/007 and design 006.
 
 * Changelog
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
+| 2026-08-12 | Made retrieval/data-plane components mandatory in the first major parity milestone and expanded current LangGraph parity semantics. | GPT-5.6 Sol | Maintainer direction plus current LangChain/LangGraph official docs |
 | 2026-08-12 | Updated async parity target to Carrier reference plus production-hardening decision. | GPT-5.6 Sol | Research 003/007 |
-| 2026-08-12 | Established current LangChain/LangGraph behavioral parity matrix. | GPT-5.6 Sol | Official documentation retrieved 2026-08-12 |
+| 2026-08-12 | Established initial LangChain/LangGraph behavioral parity matrix. | GPT-5.6 Sol | Official documentation |
 
 * Footnotes and Glossary
 
 - *HITL*: human in the loop.
 - *Checkpoint*: persisted snapshot sufficient to resume or inspect an execution thread.
+- *Pending write*: a successful task's durable state contribution saved before its parallel superstep fully commits.
 - *Semantic parity*: comparable behavior and extension points without copying another language's API shape.

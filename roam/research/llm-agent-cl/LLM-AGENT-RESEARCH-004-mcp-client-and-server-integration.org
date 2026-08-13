@@ -10,9 +10,9 @@
 
 | Approval area | Required authority | State | Evidence required | Evidence reference |
 |---------------+--------------------+-------+-------------------+--------------------|
-| MCP research | Maintainer | PENDING | Review against current specification | Sources below |
-| MCP scope | Maintainer | PENDING | Decide client/server milestone | None yet |
-| Implementation authorization | Maintainer | NOT STARTED | Approved design | None |
+| MCP research | Maintainer | APPROVED | Maintainer review | 2026-08-12: “fine as is” |
+| MCP scope | Maintainer | APPROVED | Maintainer review | 2026-08-12: “fine as is” |
+| Implementation authorization | Maintainer | NOT STARTED | Approved MCP design | Design pending review |
 
 * Current protocol baseline
 
@@ -31,15 +31,15 @@ Current transport semantics also define cancellation differently per binding: st
 
 Current tools may return text, image, audio, resource links, embedded resources, and structured JSON. This maps naturally onto the same canonical content-block and JSON-schema abstractions required by native model tools.
 
-* Recommended library split from research
+* Approved library split
 
 1. =MCP client layer=: connect to one or more servers and convert discovered MCP tools/resources/prompts to canonical library values.
 2. =Tool adapter layer=: expose MCP tools to agents without making the agent loop understand MCP.
-3. =MCP server layer=: optionally expose library-native tools/resources/prompts through MCP as a separate module.
+3. =MCP server layer=: expose library-native tools/resources/prompts through MCP as a separate module.
 4. =Transport bindings=: stdio and Streamable HTTP remain independent from protocol semantics.
 5. =Compatibility layer=: version-aware codecs/behavior for selected older MCP revisions, tested with fixtures.
 
-Client support is the first requirement because it directly satisfies “agent can use MCP tools.” Server export is valuable for composability but should not block the first provider/agent milestone.
+Client support is dependency-first because it directly satisfies “agent can use MCP tools.” Server export follows in the same first major parity milestone but does not block the first provider/agent slice.
 
 * Security requirements
 
@@ -63,7 +63,8 @@ Retrieved 2026-08-12.
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
-| 2026-08-12 | Researched current MCP 2026-07-28 semantics and library mapping. | GPT-5.6 Sol | MCP official specification retrieved 2026-08-12 |
+| 2026-08-12 | Recorded maintainer approval of MCP research and scope without authorizing implementation. | GPT-5.6 Sol | Explicit maintainer review |
+| 2026-08-12 | Researched current MCP 2026-07-28 semantics and library mapping. | GPT-5.6 Sol | MCP official specification |
 
 * Footnotes and Glossary
 

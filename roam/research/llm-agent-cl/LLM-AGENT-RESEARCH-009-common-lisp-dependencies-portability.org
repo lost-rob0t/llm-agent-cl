@@ -1,0 +1,107 @@
+:PROPERTIES:
+:ID: llm-agent-research-009
+:END:
+#+title: Common Lisp dependency and portability choices
+#+description: Dependency research for JSON, JSON Schema, concurrency, URI/octet utilities and implementation portability.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:research:common-lisp:dependencies:json:concurrency:portability:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| Dependency research | Maintainer | PENDING | Source/release review | Sources below |
+| Dependency selections | Maintainer | PENDING | Design review | Designs 001-004 |
+| Implementation authorization | Maintainer | NOT STARTED | Approved designs | None |
+
+* JSON
+
+Recommended JSON implementation: =com.inuoe.jzon= (=Zulu-Inuoe/jzon=).
+
+Reasons:
+
+- actively maintained in 2026 during this research pass;
+- MIT licensed;
+- parser/writer designed around correct JSON semantics rather than lossy Lisp conventions;
+- supports stream/string parsing and writing;
+- is already the data representation expected by the selected JSON Schema candidate.
+
+Provider adapters should isolate raw Jzon values behind canonical objects where possible. Provider-native extension maps may retain JSON-shaped values deliberately.
+
+* JSON Schema
+
+Recommended initial validator: =cl-jschema= behind an llm-agent-cl-owned validation protocol.
+
+Current upstream v1.1.3 supports JSON Schema draft 2020-12 and validates values represented using =com.inuoe.jzon=. Its documented limitations include no automatic web retrieval of schemas and a registry-oriented =$id= model.
+
+Those limits are acceptable for model tools and structured outputs because their schemas should be self-contained and deterministic. Remote schema fetching should remain disabled by default for security/reproducibility even if a future validator supports it.
+
+Before a production claim, llm-agent-cl should run the relevant JSON-Schema-Test-Suite cases required by tool and structured-output schemas. If =cl-jschema= lacks a required conformance feature, patch/fork it or replace the backend without changing the public validator protocol.
+
+* Concurrency and synchronization
+
+Use =bordeaux-threads= for portable locks, condition variables and basic thread primitives.
+
+Use =lparallel= as the initial bounded worker-pool/task-execution dependency for:
+
+- parallel tool calls;
+- independent graph tasks in a superstep;
+- bounded batch model/embedding calls when the provider adapter does not offer a more efficient native batch endpoint;
+- CPU work that should not execute inside Carrier's event loop.
+
+lparallel's promises/futures may be used internally, but its global =*kernel*= must not define llm-agent-cl's public runtime semantics. Each llm-agent runtime/executor should own or receive an executor/kernel explicitly, with scoped/process convenience defaults only through the library configuration layer.
+
+Carrier/Blackbird async values likewise remain transport implementation details. llm-agent-cl needs one public future/result/cancellation abstraction above both worker tasks and network events.
+
+* Supporting dependencies
+
+Recommended utility dependencies:
+
+- =quri= for URI parsing/rendering;
+- =babel= for explicit UTF-8/octet conversion;
+- =alexandria= for small portable utilities;
+- =bordeaux-threads= for synchronization;
+- =lparallel= for bounded task execution.
+
+Avoid introducing overlapping HTTP or JSON stacks without an integration-specific reason.
+
+* Portability target
+
+SBCL is the initial production/reference implementation because Carrier/cl-async and the surrounding ecosystem must first be made reliable there. Public code should remain portable Common Lisp where practical.
+
+Additional implementations enter the supported matrix only when CI proves the full relevant dependency graph, not because source code appears portable. ECL, CCL or others may be added later without changing public protocols.
+
+* ASDF packaging direction
+
+Use multiple small ASDF systems rather than one dependency-heavy monolith. The umbrella system may depend on the standard first-party components, while provider, MCP and retrieval integration systems remain separately loadable.
+
+This allows a consumer needing only core contracts or a single provider to avoid pulling every vector-store/database integration into its image.
+
+* Dependency ownership rule
+
+Third-party libraries implement mechanisms; llm-agent-cl owns semantics. Public contracts for JSON Schema validation, futures, cancellation, stores, providers and transports must not be aliases for a dependency's classes. This keeps upgrades/forks possible without breaking callers.
+
+* Sources
+
+Retrieved 2026-08-12.
+
+- https://github.com/Zulu-Inuoe/jzon
+- https://github.com/MauDagos/cl-jschema
+- https://github.com/json-schema-org/JSON-Schema-Test-Suite
+- https://github.com/sionescu/bordeaux-threads
+- https://lparallel.org/
+- https://quickref.common-lisp.net/lparallel.html
+- https://github.com/fukamachi/quri
+- https://github.com/cl-babel/babel
+- https://gitlab.common-lisp.net/alexandria/alexandria
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Selected initial JSON/JSON-Schema/concurrency candidates and defined dependency-isolation/portability rules. | GPT-5.6 Sol | Current upstream repositories/docs |
+
+* Footnotes and Glossary
+
+- *Backend protocol*: project-owned interface implemented by a replaceable dependency adapter.
+- *Reference implementation*: implementation on which the first production compatibility and CI guarantees are established.

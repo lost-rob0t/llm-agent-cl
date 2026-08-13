@@ -1,0 +1,254 @@
+:PROPERTIES:
+:ID: llm-agent-design-004
+:END:
+#+title: Retrieval and data plane design
+#+description: Proposed document, loader, splitter, embedding, store, vector-store, retriever and RAG package family required for first-major-milestone parity.
+#+status: DRAFT
+#+filetags: :llm-agent-cl:design:retrieval:documents:embeddings:vector-store:rag:
+
+* Approval Table
+
+| Approval area | Required authority | State | Evidence required | Evidence reference |
+|---------------+--------------------+-------+-------------------+--------------------|
+| Retrieval protocol/API shape | Maintainer | PENDING | Review this design | Research 008 |
+| First built-in integration scope | Maintainer | PENDING | Review loader/splitter/vector-store list | This design |
+| OpenRouter embeddings integration | Maintainer | PENDING | Review provider mapping | Design 002 |
+| Implementation authorization | Maintainer | NOT STARTED | Explicit approval | None |
+
+* Systems
+
+Proposed separately loadable systems:
+
+- =llm-agent/documents=;
+- =llm-agent/loaders=;
+- =llm-agent/splitters=;
+- =llm-agent/embeddings=;
+- =llm-agent/stores=;
+- =llm-agent/vector-stores=;
+- =llm-agent/retrievers=;
+- =llm-agent/retrieval= as convenience umbrella.
+
+Provider-specific embedding adapters remain in provider systems but implement the common embedding protocol.
+
+* Document
+
+Canonical =document= fields:
+
+- =id= — stable optional caller/source id;
+- =page-content= — primary textual content for first milestone;
+- =metadata= — JSON/Lisp map of source metadata;
+- =source= — normalized URI/path/source identity where known;
+- =mime-type=;
+- =provenance= — loader/source/chunk parent information;
+- extension map for loader-specific data.
+
+Document equality/id semantics should not silently hash all content. Applications may supply ids; loaders may derive deterministic ids from stable source records when appropriate.
+
+* Loader protocol
+
+Generic operations:
+
+- =load-documents(loader, context)= -> list/vector of documents;
+- =lazy-load-documents(loader, context)= -> bounded iterator/event source;
+- async equivalents resolving project futures/event sources.
+
+Loader constructors hold source-specific configuration but never global credentials invisibly. Network loaders use runtime/transport configuration.
+
+Initial built-ins:
+
+**Text loader** — wrap supplied string/text with metadata.
+
+**File loader** — load text files with explicit encoding (UTF-8 default) and source path metadata; size ceilings required.
+
+**JSON loader** — parse Jzon values and use a caller-provided extraction path/function to map records/content/metadata.
+
+**CSV loader** — row-per-document and whole-file modes with header metadata.
+
+**HTML loader** — fetch or accept HTML and produce visible/textual content through a small extraction protocol. Do not attempt browser automation in the core loader.
+
+**HTTP text loader** — fetch bounded textual resources through the common transport with content-type/size policy.
+
+Binary/PDF/office loaders are extension integrations unless a safe maintained dependency is explicitly selected later. The protocol must accommodate them without core redesign.
+
+* Splitter protocol
+
+A splitter accepts documents or text and returns ordered document chunks with parent provenance.
+
+Common config:
+
+- chunk size;
+- overlap;
+- length function/tokenizer;
+- separator set/strategy;
+- metadata transformation;
+- keep/drop separator behavior where relevant.
+
+Initial implementations:
+
+- character splitter;
+- recursive character splitter;
+- token-aware splitter using tokenizer protocol;
+- generic structure-aware extension hook.
+
+Chunking must guarantee forward progress even when one unit exceeds chunk size. Overlap must be bounded below chunk size unless an explicit strategy supports otherwise.
+
+* Tokenizer protocol
+
+Do not couple splitters to one model tokenizer package. Define:
+
+- count tokens;
+- encode/decode where backend supports it;
+- model/tokenizer identity.
+
+A simple approximate/default character length function remains usable without tokenizer integrations.
+
+* Embedding protocol
+
+Operations:
+
+- =embed-query=;
+- =embed-documents=;
+- batch-aware sync/async variants;
+- optional dimensions/input-type/provider extensions.
+
+Result carries vectors plus model/provider identity, dimensions, usage and metadata. Validate vector dimensions before inserting into stores.
+
+OpenRouter is the first remote implementation. Embedding requests reuse provider auth/config/model discovery from Design 002.
+
+* Embedding cache
+
+A cache wrapper decorates any embedding model. Cache key includes:
+
+- embedding model/provider identity;
+- relevant embedding options/dimension;
+- normalized input bytes/text hash;
+- cache schema version.
+
+Document and query caching may use separate namespaces because providers can distinguish input types. Cache values include vector and necessary identity metadata. Never cache secrets/provider headers.
+
+* Store protocol
+
+Generic key/value store operations:
+
+- =mget(namespace, keys)=;
+- =mset(namespace, pairs)=;
+- =mdelete(namespace, keys)=;
+- =yield-keys(namespace, prefix)=;
+- async equivalents where backend supports them.
+
+Keys are strings/octet keys with a documented normalized representation. Values are caller-defined serializable values/octets at this layer.
+
+Initial in-memory store is lock-safe and deterministic. Persistent adapters remain separate integrations.
+
+* Vector-store protocol
+
+Canonical methods:
+
+- add/upsert documents/texts with optional ids;
+- add vectors directly with associated documents;
+- delete ids;
+- similarity search by text/query;
+- similarity search by vector;
+- scored search;
+- metadata filtering;
+- optional max-marginal-relevance later if required by parity closure;
+- async variants.
+
+A vector store declares dimension, metric and embedding model requirements. Incompatible dimension insertion signals a typed error before mutating state.
+
+* In-memory vector store
+
+Reference backend stores vectors/documents in process memory with thread-safe mutation and exact search.
+
+Required metrics:
+
+- cosine similarity;
+- dot product;
+- Euclidean distance converted/documented as ranking score.
+
+Search is deterministic under ties (stable document id/insertion order rule). This backend is for correctness/tests/small workloads, not a claim of production ANN scalability.
+
+* Portable filters
+
+First filter language should support a conservative portable subset:
+
+- equality/inequality;
+- numeric/string comparisons;
+- membership;
+- AND/OR/NOT;
+- metadata key existence.
+
+Backends can translate supported filters or fall back to post-filtering when explicitly allowed. Unsupported filter operators signal rather than silently changing semantics.
+
+* Retriever protocol
+
+Retriever invocation maps a query/input to ordered documents and optional relevance metadata.
+
+Methods:
+
+- sync invoke;
+- async invoke;
+- bounded batch/async batch;
+- optional stream only for retrievers that naturally support progressive results; not required for vector retrieval.
+
+Implementations:
+
+- vector-store retriever;
+- callable/function retriever adapter;
+- composed retriever hooks for later FTS/graph/SQL systems.
+
+* RAG helpers
+
+Provide composable helpers rather than a mandatory “RAG chain” object:
+
+- retrieve context;
+- format documents with configurable separator/template;
+- attach source metadata/citations to runtime state;
+- create retriever-as-tool;
+- create retrieval graph node;
+- convenience =retrieve-and-generate= can be layered above these protocols.
+
+This lets retrieval work standalone, in a tool-calling agent, or in a graph.
+
+* Concurrency and resource limits
+
+- loader response/file size ceilings;
+- maximum document/chunk counts per operation;
+- bounded embedding batch size/concurrency;
+- cancellation/deadline propagation;
+- vector dimension/vector-count guardrails for in-memory store;
+- no unbounded lazy-loader buffering.
+
+* Tests
+
+Required tests:
+
+- document metadata/provenance preservation;
+- loader happy/error/size/encoding paths;
+- splitter boundary/overlap/non-progress fuzz cases;
+- embedding dimension/usage normalization and cache hits/misses;
+- store batch/thread behavior;
+- exact vector metric ranking/filtering/ties;
+- retriever sync/async/batch;
+- end-to-end minimal RAG with deterministic fake embeddings/model;
+- optional live OpenRouter embedding test with strict budget;
+- use retrieval as graph node and as canonical tool.
+
+* Related research/design
+
+- [[id:llm-agent-research-008][Retrieval parity research]]
+- [[id:llm-agent-design-001][Core contracts]]
+- [[id:llm-agent-design-002][OpenRouter embeddings]]
+- [[id:llm-agent-design-003][Agent/graph runtime]]
+
+* Changelog
+
+| Date | Change | Author or actor | Evidence |
+|------+--------+-----------------+----------|
+| 2026-08-12 | Created first-major-milestone retrieval/data-plane design. | GPT-5.6 Sol | Research 001/008 and current LangChain retrieval docs |
+
+* Footnotes and Glossary
+
+- *ANN*: approximate nearest-neighbor search.
+- *Provenance*: information connecting a derived chunk/document to its originating source/document.
+- *Embedding cache*: store-backed decorator avoiding recomputation for identical model/options/input.
