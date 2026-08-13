@@ -13,7 +13,23 @@
 | MCP package/protocol design | Maintainer | PENDING | Review this design | Research 004 |
 | Compatibility boundary | Maintainer | PENDING | Review selected legacy support approach | This design |
 | Server-export scope | Maintainer | PENDING | Review same-major-milestone placement | This design |
+| Transport/request lifecycle | Maintainer | PENDING | Review concrete state/API below | This design |
 | Implementation authorization | Maintainer | NOT STARTED | Explicit approval | None |
+
+* Goal and invariants
+
+Provide MCP client and server support through the same canonical tool/content/runtime contracts used by native integrations while keeping protocol revisions and transport behavior isolated.
+
+Invariants:
+
+1. MCP JSON-RPC values are not canonical llm-agent tool/result values; adapters normalize between them.
+2. Protocol revision selects a version-specific codec/lifecycle implementation.
+3. Current and legacy lifecycle rules are never mixed opportunistically in one permissive state machine.
+4. MCP connection/auth configuration is application-controlled, never model-controlled by default.
+5. Stdio executes argv directly; shell interpretation is not the secure default.
+6. Outstanding request ids are bounded, unique within a client, cancellation-aware and resolved exactly once.
+7. Remote descriptions/schemas/content are untrusted input.
+8. Server export remains an optional library capability, not a daemon requirement.
 
 * Systems
 
@@ -25,11 +41,28 @@ Proposed systems:
 - =llm-agent/mcp-server= — export native llm-agent tools/resources/prompts;
 - =llm-agent/mcp-compat= — explicitly tested older protocol codecs/behavior.
 
+#+begin_src text
+canonical tool/resource/prompt APIs
+              |
+              v
+         MCP adapter layer
+              |
+        version context
+         /           \
+ current codec     legacy codec(s)
+      |                 |
+      +--------+--------+
+               |
+        transport binding
+          /         \
+       stdio     streamable-http
+#+end_src
+
 The agent and tool layers depend only on canonical MCP adapters, never transport-specific stdio/process classes.
 
 * Current normative baseline
 
-Primary target is MCP 2026-07-28 as resolved by the research pass. Encode protocol version explicitly in every connection/request context; do not infer current semantics from old SDK examples.
+Primary target is MCP 2026-07-28 as resolved by the approved research pass. Encode protocol version explicitly in every peer/request context; do not infer current semantics from old SDK examples.
 
 Current JSON-RPC requests/responses/errors use self-contained per-request protocol/capability metadata. Standard transports are stdio and Streamable HTTP.
 
@@ -43,19 +76,137 @@ Implement strict JSON-RPC 2.0 parsing/serialization with:
 - standard/custom error codes;
 - bounded message size/depth;
 - unknown method error mapping;
-- provider/protocol-native =_meta= preservation.
+- protocol-native =_meta= preservation.
 
-Malformed messages produce protocol conditions rather than arbitrary Lisp errors escaping transport callbacks.
+Representative values:
+
+#+begin_src lisp
+(defclass jsonrpc-message () ())
+
+(defclass jsonrpc-request (jsonrpc-message)
+  ((id :initarg :id :reader jsonrpc-request-id)
+   (method :initarg :method :reader jsonrpc-request-method)
+   (params :initarg :params :initform nil :reader jsonrpc-request-params)
+   (meta :initarg :meta :initform nil :reader jsonrpc-request-meta)))
+
+(defclass jsonrpc-response (jsonrpc-message)
+  ((id :initarg :id :reader jsonrpc-response-id)
+   (result :initarg :result :reader jsonrpc-response-result)))
+
+(defclass jsonrpc-error-response (jsonrpc-message)
+  ((id :initarg :id :reader jsonrpc-error-id)
+   (code :initarg :code :reader jsonrpc-error-code)
+   (message :initarg :message :reader jsonrpc-error-message)
+   (data :initarg :data :initform nil :reader jsonrpc-error-data)))
+#+end_src
+
+Malformed messages produce MCP protocol conditions rather than arbitrary Jzon/Lisp errors escaping transport callbacks.
+
+* Request id and outstanding-request table
+
+One MCP client owns its request-id generator and outstanding table.
+
+#+begin_src lisp
+(defclass mcp-pending-request ()
+  ((id :initarg :id :reader pending-request-id)
+   (method :initarg :method :reader pending-request-method)
+   (future :initarg :future :reader pending-request-future)
+   (cancellation :initarg :cancellation :reader pending-request-cancellation)
+   (deadline :initarg :deadline :reader pending-request-deadline)
+   (terminal-p :initform nil :accessor pending-request-terminal-p)))
+#+end_src
+
+Rules:
+
+- ids are unique among outstanding requests;
+- max outstanding requests is configured and bounded;
+- response to unknown/terminal id is protocol diagnostic, never matched by guessing;
+- completion/error/cancellation resolves each pending future exactly once;
+- client shutdown rejects/cancels all outstanding requests deterministically.
+
+* Protocol version adapter
+
+The canonical MCP client dispatches through a version-specific implementation object.
+
+#+begin_src lisp
+(defclass mcp-protocol-adapter () ())
+
+(defgeneric protocol-version (adapter))
+(defgeneric encode-mcp-request (adapter operation arguments context))
+(defgeneric decode-mcp-response (adapter operation message context))
+(defgeneric cancellation-message (adapter pending-request))
+(defgeneric protocol-supports-p (adapter capability))
+#+end_src
+
+Version registry:
+
+#+begin_src lisp
+(find-mcp-protocol-adapter "2026-07-28")
+(find-mcp-protocol-adapter "2025-..." :errorp nil)
+#+end_src
+
+If an unknown protocol version cannot be handled safely, fail with =unsupported-mcp-version= rather than guessing.
 
 * Capability and version context
 
-Each MCP peer/client tracks supported/current protocol versions and capabilities. For current 2026-07-28 semantics, request construction includes required per-request metadata. Feature calls check negotiated/known capabilities before dispatch where the spec requires it.
+Each MCP peer/client tracks supported/current protocol versions and capabilities.
 
-Compatibility modules must be version-directed; do not create one permissive parser that mixes lifecycle rules from unrelated revisions.
+#+begin_src lisp
+(defclass mcp-peer-profile ()
+  ((identity :initarg :identity :reader mcp-peer-identity)
+   (protocol-version :initarg :protocol-version :reader mcp-peer-version)
+   (capabilities :initarg :capabilities :initform nil
+                 :reader mcp-peer-capabilities)
+   (metadata :initarg :metadata :initform nil :reader mcp-peer-metadata)))
+#+end_src
+
+For current 2026-07-28 semantics, request construction includes required per-request metadata. Feature calls check known capabilities before dispatch where the protocol requires it.
+
+Compatibility modules are version-directed; do not create one permissive parser that mixes lifecycle rules from unrelated revisions.
+
+* MCP client object
+
+#+begin_src lisp
+(defclass mcp-client ()
+  ((transport :initarg :transport :reader mcp-client-transport)
+   (protocol :initarg :protocol :reader mcp-client-protocol)
+   (peer :initarg :peer :initform nil :accessor mcp-client-peer)
+   (pending :initform (make-hash-table :test 'equal)
+            :reader mcp-client-pending)
+   (tool-cache :initform nil :accessor mcp-client-tool-cache)
+   (resource-cache :initform nil :accessor mcp-client-resource-cache)
+   (prompt-cache :initform nil :accessor mcp-client-prompt-cache)
+   (closed-p :initform nil :accessor mcp-client-closed-p)))
+#+end_src
+
+Client API supports:
+
+#+begin_src lisp
+(defgeneric mcp-list-tools (client &key refresh context))
+(defgeneric mcp-call-tool (client name arguments &key context))
+(defgeneric mcp-list-resources (client &key refresh context))
+(defgeneric mcp-read-resource (client uri &key context))
+(defgeneric mcp-list-prompts (client &key refresh context))
+(defgeneric mcp-get-prompt (client name arguments &key context))
+(defgeneric close-mcp-client (client))
+#+end_src
+
+Cache discovered lists with invalidation on list-change events/notifications supported by the selected revision. Discovery snapshots include server identity/version/capabilities and fetched timestamp.
 
 * Stdio client
 
-Client launches configured subprocess with explicit argv/environment/cwd policy. Transport:
+Client launches configured subprocess with explicit executable, argv, environment and cwd policy.
+
+#+begin_src lisp
+(make-mcp-stdio-client
+ :executable "/usr/bin/example-mcp-server"
+ :arguments '("--stdio")
+ :environment '(("TOKEN" . #<secret ...>))
+ :cwd #P"/srv/app/"
+ :protocol-version "2026-07-28")
+#+end_src
+
+Transport:
 
 - writes newline-delimited JSON-RPC to stdin;
 - reads stdout incrementally;
@@ -63,14 +214,29 @@ Client launches configured subprocess with explicit argv/environment/cwd policy.
 - bounds line/message size;
 - tracks outstanding request ids;
 - propagates process exit to pending requests;
-- implements current stdio cancellation notification semantics;
+- implements revision-correct stdio cancellation semantics;
 - kills/terminates child deterministically on client shutdown according to policy.
 
-Never execute shell strings implicitly. Accept executable + argv values; optional shell use is an explicit unsafe/convenience adapter outside the secure default.
+Never execute shell strings implicitly. Optional shell use, if added, is an explicitly unsafe/convenience adapter outside the secure default.
+
+** Stdio lifecycle
+
+#+begin_src text
+NEW -> STARTING -> RUNNING -> CLOSING -> CLOSED
+          |           |
+          |           +---- process exit/error ----> FAILED/CLOSED
+          +---- spawn failure ---------------------> FAILED/CLOSED
+#+end_src
+
+No request may be admitted once closing begins.
+
+Stdout parser operates on arbitrary octet chunks and only emits one JSON-RPC message after a complete newline-delimited record is present. Message length is checked before growing buffers beyond configured maximum.
 
 * Streamable HTTP client
 
-Use common transport request/stream contracts. Current binding:
+Use common transport request/stream contracts.
+
+Current binding:
 
 - POST each MCP message to one endpoint;
 - response may be ordinary JSON or request-scoped SSE;
@@ -78,22 +244,23 @@ Use common transport request/stream contracts. Current binding:
 - cancellation abandons/closes the request response stream through transport cancellation;
 - authentication/configuration is caller supplied through HTTP/client policy, not model-controlled tool parameters.
 
-The HTTP adapter reuses the tested SSE decoder rather than implementing separate line parsing.
+Representative call path:
 
-* MCP client object
+#+begin_src text
+mcp-call-tool
+    |
+    v
+version adapter -> JSON-RPC request
+    |
+    v
+POST via llm-agent transport
+    |
+    +-- application/json -> one JSON-RPC response
+    |
+    +-- text/event-stream -> shared SSE decoder -> JSON-RPC event/response(s)
+#+end_src
 
-Client API supports:
-
-- list/refresh tools;
-- call tool;
-- list/read resources and templates;
-- subscribe/unsubscribe where supported;
-- list/get prompts;
-- progress/event callbacks;
-- cancellation/deadline;
-- close/shutdown.
-
-Cache discovered lists with invalidation on list-change notifications/events. Discovery snapshots include server identity/version/capabilities and fetched timestamp.
+The HTTP adapter reuses the tested Design 002 SSE decoder rather than implementing separate line parsing.
 
 * Canonical tool mapping
 
@@ -107,17 +274,78 @@ Each discovered MCP tool maps to a native canonical tool descriptor:
 - MCP content result -> canonical content blocks/tool result;
 - is-error/protocol errors -> typed tool/MCP conditions.
 
+Representative adapter:
+
+#+begin_src lisp
+(defun mcp-tool->canonical-tool (client server-id remote-tool)
+  (make-instance 'llm.tool:tool
+   :name (format nil "mcp.~A.~A"
+                 (sanitize-tool-namespace server-id)
+                 (mcp-tool-name remote-tool))
+   :description (mcp-tool-description remote-tool)
+   :input-schema (mcp-tool-input-schema remote-tool)
+   :output-schema (mcp-tool-output-schema remote-tool)
+   :callable
+   (lambda (arguments context)
+     (mcp-call-tool client
+                    (mcp-tool-name remote-tool)
+                    arguments
+                    :context context))
+   :metadata `((:mcp-server-id . ,server-id)
+               (:mcp-tool-name . ,(mcp-tool-name remote-tool)))))
+#+end_src
+
 A model never receives raw ability to select arbitrary MCP connection configuration.
+
+* MCP content -> canonical content
+
+Result conversion is exhaustive and explicit.
+
+#+begin_src lisp
+(defgeneric mcp-content->canonical-block (content context))
+#+end_src
+
+Text/image/audio/resource-link/embedded-resource/structured content maps to matching canonical blocks where representable.
+
+Unknown content variant policy is one of:
+
+- preserve as bounded =provider/native= style MCP block;
+- typed unsupported-content error;
+- explicit caller conversion policy.
+
+Never silently drop content.
 
 * Resources and prompts
 
 Resources map to canonical typed resource/document-ish content without conflating resources with vector retrieval. Preserve URI, mime type, annotations and embedded text/blob data.
 
-Prompts map to prompt-template values/messages and retain required arguments/metadata. An application may choose to expose them to an agent; discovery alone does not mutate the active system prompt.
+#+begin_src lisp
+(mcp-read-resource client "file:///project/README.md")
+#+end_src
+
+Prompts map to prompt-template values/messages and retain required arguments/metadata.
+
+#+begin_src lisp
+(mcp-get-prompt client "code-review"
+                '(("language" . "common-lisp")))
+#+end_src
+
+An application may choose to expose them to an agent; discovery alone does not mutate the active system prompt.
 
 * MCP server export
 
 Server module exposes registered llm-agent native tools/resources/prompts through MCP. It is an optional library system, not a daemon requirement. Applications choose stdio or Streamable HTTP hosting/integration.
+
+Representative registry:
+
+#+begin_src lisp
+(let ((server (make-mcp-server
+               :protocol-version "2026-07-28"
+               :tools (list native-search-tool native-read-tool)
+               :resources resource-registry
+               :prompts prompt-registry)))
+  (serve-mcp-stdio server))
+#+end_src
 
 Tool export:
 
@@ -129,9 +357,37 @@ Tool export:
 
 Resource/prompt registries follow the same explicit registration model.
 
+* Server request execution
+
+Remote request -> local operation path:
+
+#+begin_src text
+JSON-RPC request
+    |
+    v
+version adapter validates method/params/meta
+    |
+    v
+local authorization/filter policy
+    |
+    v
+child runtime context
+  cancellation + deadline + event/progress sink
+    |
+    v
+canonical tool/resource/prompt operation
+    |
+    v
+canonical result -> MCP conversion -> JSON-RPC response
+#+end_src
+
+The server must never call arbitrary symbols based on remote method/tool names; only explicitly registered canonical operations are reachable.
+
 * Security/trust boundary
 
-Remote MCP metadata is untrusted. Requirements:
+Remote MCP metadata is untrusted.
+
+Requirements:
 
 - validate schemas and message sizes;
 - sanitize names for display/namespace without losing original identity;
@@ -139,25 +395,92 @@ Remote MCP metadata is untrusted. Requirements:
 - model cannot alter server endpoint/credentials unless the application intentionally exposes such a tool;
 - local allow/deny middleware can filter discovered tools/resources;
 - never log MCP auth headers/secrets;
-- HTTP server implementation applies Origin/auth rules required by current spec;
-- stdio environment inherited by subprocess should be explicit/filterable.
+- HTTP server implementation applies Origin/auth rules required by selected protocol revision;
+- stdio environment inherited by subprocess is explicit/filterable;
+- resource URI schemes can be locally restricted;
+- binary/blob result sizes are bounded.
+
+Representative discovery filter:
+
+#+begin_src lisp
+(make-mcp-policy
+ :allow-tools '("search" "read")
+ :deny-resource-schemes '("ssh" "exec")
+ :max-result-bytes (* 8 1024 1024))
+#+end_src
+
+Remote tool descriptions and schemas can inform model/tool use but cannot expand this policy.
 
 * Legacy compatibility
 
-Support selected older MCP revisions only through fixtures and version-specific adapters. Initial compatibility research should target the immediately useful session-oriented 2025-era revision(s) encountered in real servers.
+Support selected older MCP revisions only through fixtures and version-specific adapters. Initial compatibility implementation targets useful session-oriented 2025-era revision(s) encountered in real servers.
 
-Compatibility implementation may emulate initialization/session ids/server requests where the older revision requires them, but must return canonical client/tool/resource results above that layer.
+#+begin_src text
+canonical MCP operation
+       |
+       +-- adapter current-2026
+       |
+       +-- adapter legacy-2025-X
+       |
+       +-- unknown -> unsupported-mcp-version
+#+end_src
 
-If an unknown protocol version cannot be handled safely, fail with =unsupported-mcp-version= rather than guessing.
+Compatibility implementation may emulate initialization/session ids/server requests where an older revision requires them, but canonical client/tool/resource results above that layer remain unchanged.
+
+No auto-detection by “try old behavior until something works” unless the protocol itself defines a safe negotiation path. Version selection/negotiation is explicit and traced.
 
 * Cancellation
 
-Public MCP future/request ids integrate with runtime cancellation token.
+Public MCP requests integrate with Design 001 cancellation tokens.
 
-- stdio current binding sends cancellation notification and marks local request cancelled;
-- Streamable HTTP cancels/abandons the underlying HTTP response stream;
+** Client request race
+
+#+begin_src text
+PENDING
+  +-- response result ------> COMPLETED
+  +-- response error -------> FAILED
+  +-- cancellation ---------> CANCELLED
+  +-- deadline -------------> FAILED(timeout)
+  +-- transport/process exit> FAILED
+#+end_src
+
+Exactly one terminal transition wins.
+
+Transport action after cancellation:
+
+- stdio: emit revision-correct cancellation message where supported and mark local request cancelled;
+- Streamable HTTP: cancel/abandon underlying response stream;
 - late responses after local terminal cancellation are discarded/traced safely;
 - exported server tools receive child cancellation tokens.
+
+* Progress/events
+
+Protocol-native progress is translated to typed MCP/canonical runtime events with request/tool identity.
+
+#+begin_src lisp
+(make-instance 'stream-event
+ :kind :mcp-progress
+ :payload progress-value
+ :metadata `((:mcp-request-id . ,request-id)
+             (:server-id . ,server-id)))
+#+end_src
+
+Progress cannot resolve a request and is ignored after terminal state.
+
+* Error normalization
+
+Typed families should distinguish:
+
+- JSON-RPC parse/invalid-request/method errors;
+- unsupported protocol version/capability;
+- stdio spawn/process/line-size failure;
+- HTTP/transport failure;
+- remote MCP error response;
+- local authorization rejection;
+- content/schema conversion failure;
+- cancellation/deadline.
+
+The canonical tool adapter may wrap an MCP-specific condition in =tool-error= while preserving safe MCP metadata for diagnostics.
 
 * Tests
 
@@ -173,18 +496,69 @@ Fixture/interoperability tests include:
 - child process failure;
 - authorization/redaction checks;
 - server export round trip;
-- selected legacy protocol fixture proving compatibility or explicit rejection.
+- selected legacy protocol fixture proving compatibility or explicit rejection;
+- current and legacy fixtures cannot accidentally share incompatible lifecycle behavior;
+- outstanding request limit and shutdown cleanup;
+- stdout fragmentation at every byte boundary for small fixture messages.
+
+** Exact-once response correlation test
+
+#+begin_src lisp
+(test duplicate-response-does-not-double-resolve
+  (let ((request (start-fixture-request)))
+    (deliver-result request '(("ok" . t)))
+    (deliver-result request '(("ok" . nil)))
+    (is (= 1 (pending-terminal-transition-count request)))
+    (is (equal '(("ok" . t)) (await (pending-request-future request))))))
+#+end_src
+
+** Unknown version test
+
+#+begin_src lisp
+(test unknown-mcp-version-fails-closed
+  (signals unsupported-mcp-version
+    (make-mcp-client :protocol-version "2099-01-01" ...)))
+#+end_src
 
 No external MCP server is required for deterministic CI.
 
 * Implementation order
 
-1. JSON-RPC + current protocol values/capabilities.
-2. stdio client + deterministic fixture server.
-3. canonical tool/resource/prompt adapters.
-4. Streamable HTTP client using existing transport/SSE.
-5. server export.
-6. selected legacy compatibility modules.
+1. JSON-RPC values/parser/serializer + bounds;
+2. protocol adapter registry + current 2026-07-28 codec/capability context;
+3. stdio transport/client + deterministic fixture server;
+4. outstanding request state machine/cancellation/deadline;
+5. canonical tool/resource/prompt adapters;
+6. Streamable HTTP client using existing transport/SSE;
+7. server export + local authorization policy;
+8. selected legacy compatibility modules;
+9. interoperability/conformance matrix.
+
+* Rejected alternatives
+
+** One permissive “MCP parser” for every revision
+
+Rejected because lifecycle/session/cancellation semantics have changed; accepting mixed semantics creates hard-to-debug interoperability and security failures.
+
+** Expose MCP tools directly as raw JSON maps to agents
+
+Rejected because native tools and MCP tools should share validation, policy, execution and result semantics.
+
+** Let the model choose MCP endpoints/credentials automatically
+
+Rejected as a dangerous default. Connection configuration is application policy; it may only become model-reachable through an explicitly registered administrative tool.
+
+** Treat subprocess stderr as protocol
+
+Rejected because it corrupts framing and allows diagnostics to masquerade as JSON-RPC messages.
+
+* Open design questions for maintainer approval
+
+1. Which exact legacy MCP revision(s) ship in first-major-milestone compatibility. Recommendation: only revisions backed by real interoperability need + deterministic fixtures.
+2. Namespacing format for discovered tools. Recommendation: stable server-id namespace separate from display name; avoid irreversible lossy sanitization.
+3. Whether server export is required before first parity claim. Current design says yes within the same major milestone, after client support.
+4. Whether discovery caches persist across client reconnects. Recommendation: default no; a reconnect/new peer profile invalidates unless server identity/version proves equivalence.
+5. Whether stdout protocol decoding permits blank lines. Recommendation: version/transport spec decides; do not silently treat arbitrary whitespace diagnostics as valid messages.
 
 * Related research/design
 
@@ -197,9 +571,11 @@ No external MCP server is required for deterministic CI.
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
+| 2026-08-12 | Expanded JSON-RPC/request state, version adapters, stdio/HTTP lifecycle, canonical mapping, server execution, security and concrete tests. | GPT-5.6 Sol | Design review pass |
 | 2026-08-12 | Created MCP client/server, transport and compatibility implementation design. | GPT-5.6 Sol | Approved research 004 and MCP 2026-07-28 spec |
 
 * Footnotes and Glossary
 
 - *Namespaced tool name*: local collision-resistant name combining MCP server identity with remote tool name.
 - *Protocol compatibility module*: version-specific lifecycle/codec implementation isolated below canonical MCP APIs.
+- *Outstanding request*: sent request whose canonical future has not yet reached a terminal state.
