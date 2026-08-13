@@ -2,7 +2,7 @@
 :ID: llm-agent-design-index-000
 :END:
 #+title: llm-agent-cl implementation design index
-#+description: Canonical implementation-ready design set produced after the initial auto-research phase.
+#+description: Canonical implementation-ready design set produced after research and expanded through maintainer-directed design review.
 #+status: DRAFT
 #+filetags: :llm-agent-cl:index:design:implementation:
 
@@ -10,12 +10,14 @@
 
 | Approval area | Required authority | State | Evidence required | Evidence reference |
 |---------------+--------------------+-------+-------------------+--------------------|
-| Design set completeness | Maintainer | PENDING | Review designs 001-006 | Links below |
+| Design set completeness | Maintainer | PENDING | Review revised designs 001-006 | Links below |
 | Implementation authorization | Maintainer | NOT STARTED | Explicit approval of applicable designs | None |
 
 * Purpose
 
 This index is the handoff from research into maintainer design review. It does not itself authorize code changes. Merging these documents only publishes the proposed architecture.
+
+The 2026-08-12 detailed design pass expanded all six designs from architecture prose into more directly implementable contracts: concrete Common Lisp API sketches, state machines, ownership rules, deterministic failure/recovery semantics, resource limits, test examples and explicit open questions.
 
 * Canonical designs
 
@@ -25,6 +27,32 @@ This index is the handoff from research into maintainer design review. It does n
 - [[id:llm-agent-design-004][Retrieval and data plane]]
 - [[id:llm-agent-design-005][MCP integration]]
 - [[id:llm-agent-design-006][Carrier maintained-fork hardening]]
+
+* Detailed review pass status
+
+| Design | Review-pass result | Highest-impact remaining maintainer choices |
+|--------+--------------------+---------------------------------------------|
+| 001 Core | REVISED / AWAITING APPROVAL | canonical class/struct split; default config registry; channel/await semantics |
+| 002 OpenRouter | REVISED / AWAITING APPROVAL | stream event naming; stale capability policy; retry defaults; sync streaming scope |
+| 003 Graph/agent | REVISED / AWAITING APPROVAL | replace-channel conflicts; checkpoint codec; task-id representation; interrupt representation; concurrent thread writers |
+| 004 Retrieval | REVISED / AWAITING APPROVAL | document accessor naming; Euclidean score conversion; add-documents vs add-vectors ergonomics; first HTML dependency |
+| 005 MCP | REVISED / AWAITING APPROVAL | exact legacy revisions; tool namespace format; server-export gate; discovery cache reconnect policy |
+| 006 Carrier | REVISED / AWAITING APPROVAL | submit-request return shape; close policy; public deadline shape; insecure test API; proxy/cookie compatibility |
+
+“Revised” is not approval. All implementation authorization remains blocked until the maintainer explicitly approves the applicable design areas.
+
+* Cross-design invariants confirmed by review
+
+The revised designs agree on these shared contracts:
+
+1. **Project-owned semantics** — third-party futures, sockets, JSON objects, provider payloads and persistence implementations stay behind adapters.
+2. **Exactly-once terminal state** — futures, provider streams, MCP requests and Carrier requests have one completion/failure/cancellation winner.
+3. **Explicit cancellation/deadline** — child operations inherit/narrow runtime cancellation and monotonic deadlines.
+4. **Bounded concurrency/backpressure** — worker queues, event channels, graph fan-out, MCP outstanding requests, retrieval batches and Carrier pools/waiters have limits.
+5. **Deterministic graph mechanics** — task ids, reducer order, checkpoint lineage and pending-write recovery do not depend on thread/hash order.
+6. **Secret redaction** — secrets remain configuration values and never enter logs/checkpoints/provider metadata by accident.
+7. **Explicit resource ownership** — injected resources remain caller-owned unless ownership is transferred; internally created resources close deterministically.
+8. **Fail-closed capability/security behavior** — required provider features, TLS identity verification, MCP versions and filter semantics are not silently downgraded.
 
 * Dependency-aware implementation sequence
 
@@ -38,30 +66,47 @@ If the maintainer approves the design set, implementation should proceed in depe
 6. **MCP** — current client bindings first, then server export and compatibility fixtures.
 7. **Parity closure** — run the full first-major-milestone matrix and close missing behavioral gaps before claiming feature parity.
 
+Carrier hardening can proceed in its separate repository in parallel with early core work once Designs 001 and 006 expose stable integration expectations; llm-agent-cl must not consume Carrier as production async transport until its required TLS/lifecycle release gates pass.
+
 Parallel work is acceptable only where dependency contracts are already stable. Each slice should get its own tests and PR rather than accumulating an unreviewable monolith.
 
 * First-major-milestone definition
 
 The first major milestone includes all capability classes required by [[id:llm-agent-research-001][parity research]], including retrieval. It is not complete merely when OpenRouter chat and a tool loop work.
 
+Minimum closure classes include:
+
+- provider-neutral canonical messages/content/results;
+- sync + real async/cancellable transport semantics;
+- OpenRouter chat, streaming, tools, structured output, model discovery and embeddings;
+- graph reducers/supersteps/Send/Command/checkpoints/pending writes/interrupts/subgraphs/time travel;
+- high-level agent built on the graph runtime;
+- documents/loaders/splitters/embeddings/stores/vector stores/retrievers/RAG composition;
+- current MCP client transports plus server export and explicitly selected compatibility fixtures;
+- deterministic conformance tests and bounded live-provider smoke tests.
+
 * Review guidance
 
-The highest-impact choices to review are:
+For final maintainer approval, review the explicit “Open design questions for maintainer approval” section in each design rather than only the introductory architecture prose.
 
-- public canonical type shapes and extension maps in Design 001;
-- configuration precedence and provider capabilities in Design 002;
-- graph reducer/superstep/checkpoint semantics in Design 003;
-- retrieval protocol/built-in scope in Design 004;
-- current-vs-legacy MCP compatibility boundary in Design 005;
-- TLS/cancellation/pooling/backward compatibility in Design 006.
+Highest-risk decisions:
+
+- **001:** public canonical value/future/context/resource ownership contracts;
+- **002:** SSE/tool-call assembly, retry boundary, terminal state and capability fallback;
+- **003:** deterministic reducer/superstep/checkpoint/pending-write semantics;
+- **004:** vector score/filter semantics and provenance guarantees;
+- **005:** protocol-version isolation and trust boundary;
+- **006:** TLS verification, request terminal guard, connection-pool isolation and compatibility migration.
 
 * Changelog
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
+| 2026-08-12 | Recorded expanded design-review pass across Designs 001-006 and cross-design invariants/open approval choices. | GPT-5.6 Sol | Maintainer-directed design review |
 | 2026-08-12 | Created implementation design index and dependency-aware handoff order. | GPT-5.6 Sol | Research 001-009 |
 
 * Footnotes and Glossary
 
 - *Design approval*: explicit maintainer authorization of a canonical design, independent of whether its file is merged.
 - *Parity closure*: final conformance pass proving the required capability matrix rather than assuming it from component completion.
+- *Review-pass result*: editorial/technical refinement status only; it does not authorize implementation.
