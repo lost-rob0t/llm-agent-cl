@@ -13,7 +13,23 @@
 | OpenRouter API design | Maintainer | PENDING | Review endpoint/capability mapping | Research 002 |
 | Transport adapter design | Maintainer | PENDING | Review Dexador/Carrier semantics | Research 003/007 |
 | Streaming/retry design | Maintainer | PENDING | Review state/error rules | This design |
+| Wire mapping/tool assembly | Maintainer | PENDING | Review concrete examples below | This design |
 | Implementation authorization | Maintainer | NOT STARTED | Explicit approval + Carrier design where async used | None |
+
+* Goal and invariants
+
+Implement OpenRouter as the first production provider adapter without allowing OpenRouter JSON, HTTP/SSE chunking, Dexador objects, Carrier handles or Blackbird promises to become public llm-agent-cl semantics.
+
+Invariants:
+
+1. Canonical messages/results/events from Design 001 are the provider boundary.
+2. Request serialization is deterministic for the same canonical request/options.
+3. SSE is decoded as a byte stream; HTTP chunk boundaries have no semantic meaning.
+4. Tool arguments are not parsed until assembly is complete.
+5. Exactly one terminal state wins completion/failure/cancellation/deadline races.
+6. No transparent retry occurs after semantic stream output has been exposed.
+7. Unsupported required capabilities fail explicitly; fields are never silently dropped.
+8. Provider-native metadata is preserved in namespaced extensions.
 
 * Systems and package boundaries
 
@@ -24,7 +40,32 @@ Proposed systems:
 - =llm-agent/transport-carrier= — asynchronous backend pinned to the maintained Carrier fork release;
 - =llm-agent/provider-openrouter= — OpenRouter chat/models/embeddings/capability mapping.
 
-Provider code depends on the transport protocol, not Dexador/Carrier directly. The SSE decoder consumes byte chunks from either backend.
+#+begin_src text
+canonical request
+      |
+      v
+provider-openrouter
+      |
+      +---- JSON encode / response normalize
+      |
+      v
+transport protocol
+   /       \
+Dexador   Carrier
+   \       /
+    byte/body stream
+          |
+          v
+      sse decoder
+          |
+          v
+OpenRouter stream assembler
+          |
+          v
+canonical stream events/result
+#+end_src
+
+Provider code depends on the transport protocol, not Dexador/Carrier directly. The SSE decoder consumes arbitrary octet chunks from either backend.
 
 * Provider client
 
@@ -41,7 +82,23 @@ An OpenRouter client/config contains:
 - retry policy;
 - middleware/event hooks.
 
+Representative implementation shape:
+
+#+begin_src lisp
+(defclass openrouter-client (llm.provider:model-client)
+  ((config :initarg :config :reader openrouter-config)
+   (transport :initarg :transport :reader openrouter-transport)
+   (capability-cache :initarg :capability-cache
+                     :reader openrouter-capability-cache)
+   (retry-policy :initarg :retry-policy :reader openrouter-retry-policy)))
+
+(defun make-openrouter-client (&key config transport retry-policy)
+  ...)
+#+end_src
+
 Configuration resolution follows Design 001: explicit call > client > dynamic > process default > =OPENROUTER_API_KEY= for credentials.
+
+The resolved API key is revealed only while constructing the HTTP Authorization header and must not be copied into provider metadata, stream events or checkpointable values.
 
 * Endpoint families
 
@@ -53,11 +110,70 @@ Configuration resolution follows Design 001: explicit call > client > dynamic > 
 
 **Responses** remains an optional beta endpoint family. It may have an adapter later but cannot define core conversation state or replace Chat Completions in the first production slice.
 
+* Canonical request object at provider boundary
+
+Provider invocation receives canonical messages plus a provider-neutral option object/map. A representative normalized request before OpenRouter mapping is:
+
+#+begin_src lisp
+(make-model-request
+ :model "openai/gpt-5"
+ :messages (list (make-user-message "weather in Columbus?"))
+ :tools (list weather-tool)
+ :tool-choice :auto
+ :temperature 0.2
+ :structured-output nil
+ :extensions '((:openrouter . ((:provider . ((:sort . "throughput")))))))
+#+end_src
+
+The provider adapter validates canonical content/tool/schema semantics before serialization.
+
 * Chat request mapping
 
 Translate canonical messages/content/tools to OpenRouter JSON. Reject unsupported canonical content blocks explicitly unless a documented provider fallback exists.
 
-Expose provider-specific request extensions for routing, transforms and future OpenRouter fields without adding them to every provider's canonical interface.
+Representative mapping:
+
+#+begin_src lisp
+(defgeneric encode-openrouter-message (message))
+(defgeneric encode-openrouter-content-block (block))
+
+(defun encode-openrouter-chat-request (request)
+  (jzon-object
+   "model" (model-request-model request)
+   "messages" (map 'vector #'encode-openrouter-message
+                   (model-request-messages request))
+   "tools" (and (model-request-tools request)
+                (map 'vector #'encode-openrouter-tool
+                     (model-request-tools request)))
+   "stream" (model-request-stream-p request)))
+#+end_src
+
+Illustrative JSON for one tool:
+
+#+begin_src json
+{
+  "model": "openai/gpt-5",
+  "messages": [
+    {"role": "user", "content": "weather in Columbus?"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "weather",
+        "description": "Get weather",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }
+  ]
+}
+#+end_src
+
+Provider-specific request extensions for routing, transforms and future fields live under the OpenRouter extension namespace. They never become mandatory fields of other provider adapters.
 
 Tool definitions include canonical name, description and JSON Schema parameters. Tool-call ids are never regenerated after provider response normalization.
 
@@ -71,6 +187,19 @@ Canonical structured-output request supports:
 - tool-mediated fallback preference;
 - final validation policy.
 
+Representative canonical shape:
+
+#+begin_src lisp
+(defclass structured-output-spec ()
+  ((name :initarg :name :reader structured-output-name)
+   (schema :initarg :schema :reader structured-output-schema)
+   (strict-p :initarg :strict-p :initform t :reader structured-output-strict-p)
+   (strategy :initarg :strategy :initform :provider-native
+             :reader structured-output-strategy)
+   (fallback :initarg :fallback :initform :error
+             :reader structured-output-fallback)))
+#+end_src
+
 For OpenRouter provider-native strategy emit:
 
 #+begin_src json
@@ -78,15 +207,21 @@ For OpenRouter provider-native strategy emit:
   "response_format": {
     "type": "json_schema",
     "json_schema": {
-      "name": "...",
+      "name": "result",
       "strict": true,
-      "schema": {}
+      "schema": {"type": "object"}
     }
   }
 }
 #+end_src
 
-Before dispatch, use model capability data when available. When routing through multiple providers and the request requires structured output/tools/etc., apply OpenRouter's =require_parameters= routing option where appropriate. Stale/absent capability information cannot cause silent field removal; either attempt with explicit provider behavior or signal unsupported according to caller policy.
+Before dispatch, use model capability data when available. When routing through multiple providers and the request requires structured output/tools/etc., apply OpenRouter's =require_parameters= routing option where appropriate.
+
+Stale/absent capability information cannot cause silent field removal. Caller policy chooses among:
+
+- =:require-known= -> fail before dispatch if support cannot be established;
+- =:attempt= -> send required field and let provider answer;
+- explicit fallback strategy -> caller-selected alternative only.
 
 For streaming structured output, emit raw/partial structured-text deltas as stream events. Parse/validate the complete JSON only at terminal completion. A syntactically incomplete partial value is not a schema error until the stream ends unexpectedly or completion is declared.
 
@@ -105,23 +240,140 @@ The SSE system accepts arbitrary octet chunks and incrementally decodes UTF-8/fr
 
 OpenRouter mapping then interprets =data:= payloads as JSON or terminal =[DONE]=. HTTP chunk boundaries are irrelevant.
 
+** Decoder state
+
+#+begin_src lisp
+(defclass sse-decoder ()
+  ((utf8-state :initarg :utf8-state :reader sse-utf8-state)
+   (line-buffer :initform (make-octet-buffer) :accessor sse-line-buffer)
+   (data-lines :initform '() :accessor sse-data-lines)
+   (event-name :initform nil :accessor sse-event-name)
+   (event-id :initform nil :accessor sse-event-id)
+   (retry :initform nil :accessor sse-retry)
+   (bytes-seen :initform 0 :accessor sse-bytes-seen)
+   (limits :initarg :limits :reader sse-limits)))
+
+(defgeneric feed-sse-octets (decoder octets start end emit))
+(defgeneric finish-sse-decoder (decoder emit))
+#+end_src
+
+The decoder does not parse JSON. It emits complete SSE events to the OpenRouter layer.
+
+** Parsing state machine
+
+#+begin_src text
+OCTETS
+  |
+  v
+incremental UTF-8 decode
+  |
+  v
+line accumulator -- newline --> parse field
+  |                            |
+  |                            +-- ':' comment -> ignore/optional heartbeat event
+  |                            +-- data -> append data line
+  |                            +-- event/id/retry -> store field
+  |
+blank line
+  |
+  v
+emit one complete SSE event
+  |
+  v
+clear event fields, keep decoder alive
+#+end_src
+
+A blank event with no data/event fields is ignored. Multi-line data joins with newline according to SSE semantics.
+
+** Fragmentation invariant
+
+For any valid byte sequence =B= and any partition of =B= into chunks, feeding those chunks in order must produce the same event sequence as feeding =B= in one chunk.
+
+That becomes a property/fuzz test, not merely a few hand-picked chunk tests.
+
+* OpenRouter stream assembler
+
+The assembler consumes complete SSE data payloads and produces canonical stream events/results.
+
+Representative state:
+
+#+begin_src lisp
+(defclass openrouter-stream-state ()
+  ((request-id :initarg :request-id :reader stream-request-id)
+   (message-id :initform nil :accessor stream-message-id)
+   (tool-calls :initform (make-hash-table :test 'equal)
+               :reader stream-tool-calls)
+   (text-fragments :initform '() :accessor stream-text-fragments)
+   (reasoning-fragments :initform '() :accessor stream-reasoning-fragments)
+   (structured-fragments :initform '() :accessor stream-structured-fragments)
+   (usage :initform nil :accessor stream-usage)
+   (terminal-state :initform :open :accessor stream-terminal-state)))
+#+end_src
+
+* Tool-call delta assembly
+
+Streaming tool calls may arrive in fragments. The adapter maintains a per-call assembly record keyed first by provider call index and then stabilized by provider call id once known.
+
+#+begin_src lisp
+(defclass tool-call-assembly ()
+  ((index :initarg :index :reader assembly-index)
+   (id :initarg :id :initform nil :accessor assembly-id)
+   (name :initarg :name :initform nil :accessor assembly-name)
+   (argument-fragments :initform '() :accessor assembly-argument-fragments)
+   (complete-p :initform nil :accessor assembly-complete-p)))
+#+end_src
+
+Example provider fragments:
+
+#+begin_src json
+{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"weather","arguments":"{\"ci"}}]}}
+{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ty\":\"Columbus\"}"}}]}}
+#+end_src
+
+Canonical event sequence:
+
+#+begin_src text
+:tool-call-start        id=call_1 name=weather
+:tool-call-arguments-delta "{\"ci"
+:tool-call-arguments-delta "ty\":\"Columbus\"}"
+:tool-call-ready        id=call_1 arguments={"city":"Columbus"}
+#+end_src
+
+The JSON parser runs only when the call is declared/known complete by the response lifecycle. If final assembled JSON is invalid, signal a typed incomplete/malformed tool-call condition with bounded raw diagnostic text.
+
+Multiple parallel tool calls must remain correlated independently even when fragments interleave.
+
 * Stream event model
 
 Normalize provider stream data into typed events such as:
 
-- =message-start=;
-- =text-delta=;
-- =reasoning-delta=;
-- =tool-call-start=;
-- =tool-call-arguments-delta=;
-- =tool-call-ready=;
-- =structured-output-delta=;
-- =usage=;
-- =provider-metadata=;
-- =message-complete=;
-- =stream-error= / =stream-cancelled=.
+- =:message-start=;
+- =:content-delta= with content subtype =:text=;
+- =:reasoning-delta=;
+- =:tool-call-start=;
+- =:tool-call-arguments-delta=;
+- =:tool-call-ready=;
+- =:structured-output-delta=;
+- =:usage=;
+- =:provider-metadata=;
+- =:message-complete=;
+- terminal =:complete= / =:error= / =:cancelled=.
 
-Tool arguments are assembled by call index/id and parsed only when complete. Preserve raw fragments for diagnostics within safe size limits.
+These should align with the Design 001 event model rather than define a parallel hierarchy.
+
+Every event carries enough correlation metadata for concurrent invocations:
+
+#+begin_src lisp
+(make-instance 'stream-event
+ :kind :content-delta
+ :payload "hel"
+ :metadata '((:request-id . "req-1")
+             (:message-id . "msg-1")
+             (:sequence . 7)
+             (:content-kind . :text)))
+#+end_src
+
+Provider-native chunk payloads may be attached only under bounded debug/provider extensions; callers should not need them for ordinary use.
 
 * Sync transport: Dexador
 
@@ -130,16 +382,28 @@ Dexador adapter responsibilities:
 - canonical request -> Dexador options;
 - TLS defaults remain verified;
 - response status/headers/body normalization;
-- streaming body path capable of feeding SSE incrementally rather than reading the entire response when the API supports it;
+- streaming body path capable of feeding SSE incrementally rather than reading the entire response when available;
 - deadline/timeout translation as far as Dexador permits;
 - typed condition normalization;
 - deterministic closure.
 
-If Dexador cannot provide an exact async-style cancellation primitive for a blocking sync call, the sync contract documents cancellation points rather than pretending preemption is guaranteed.
+Representative adapter shape:
+
+#+begin_src lisp
+(defclass dexador-transport (llm.transport:transport) ())
+
+(defmethod llm.transport:execute-request ((transport dexador-transport)
+                                          request
+                                          &key context)
+  ;; Translate request, invoke Dexador, normalize response/conditions.
+  ...)
+#+end_src
+
+If Dexador cannot provide exact preemptive cancellation for a blocking sync call, the sync contract documents cancellation points rather than pretending forced interruption is guaranteed.
 
 * Async transport: Carrier
 
-The Carrier adapter targets the **hardened maintained fork release**, not current stock master. It uses the new client/request-handle API from Design 006 for:
+The Carrier adapter targets the **hardened maintained fork release**, not stock master. It uses the new client/request-handle API from Design 006 for:
 
 - verified TLS;
 - request cancellation;
@@ -148,30 +412,102 @@ The Carrier adapter targets the **hardened maintained fork release**, not curren
 - connection reuse;
 - deterministic shutdown.
 
-Blackbird promises and cl-async sockets are converted to project-owned future/stream values.
+#+begin_src lisp
+(defclass carrier-transport (llm.transport:transport)
+  ((client :initarg :client :reader carrier-client)))
 
-* Cancellation
+(defmethod llm.transport:execute-request-async ((transport carrier-transport)
+                                                request
+                                                &key context)
+  ;; Bridge Carrier request handle/Blackbird result into llm-agent future.
+  ...)
+#+end_src
 
-Cancellation token callback invokes Carrier request cancellation for async requests. Once cancellation wins the terminal-state race:
+Blackbird promises and cl-async sockets are converted to project-owned future/stream values immediately at the adapter boundary.
+
+* Terminal arbiter and cancellation
+
+One object owns the provider request terminal transition. Transport callbacks, SSE completion, cancellation and deadline all attempt to transition it atomically.
+
+#+begin_src text
+                        provider complete
+                    +----------------------> COMPLETED
+                    |
+OPEN ---------------+ transport/provider --> FAILED
+                    |
+                    + cancellation --------> CANCELLED
+                    |
+                    + deadline ------------> FAILED(timeout)
+#+end_src
+
+Exactly one transition wins. All losers perform only idempotent cleanup/diagnostics.
+
+Cancellation token callback invokes Carrier request cancellation for async requests. Once cancellation wins:
 
 - no more public deltas are emitted;
 - the stream terminates with typed cancelled state;
 - late transport callbacks are discarded safely;
-- the provider result cannot later become successful.
+- the provider result cannot later become successful;
+- any queued retry/backoff is cancelled.
 
 OpenRouter may continue upstream work depending on downstream provider behavior, but local network processing must terminate immediately and accurately report local cancellation.
 
-* Retry classification
+Representative guard:
 
-Automatic retry allowed only when policy and failure stage make it safe. Examples:
+#+begin_src lisp
+(when (terminal-transition request-state :cancelled reason)
+  (cancel-transport-handle handle)
+  (channel-terminal-cancel event-channel reason))
+#+end_src
 
-- DNS/connect failure before request write: usually safe;
-- retryable 429/5xx before response content: policy-controlled;
-- failure after unknown amount of request was transmitted: potentially ambiguous;
-- once stream content/tool deltas are emitted: no transparent replay;
-- embedding request: may retry pre-response under bounded policy because it is side-effect-free, but still respect deadlines/rate limits.
+=TERMINAL-TRANSITION= returns true only for the winning caller.
 
-Honor =Retry-After= where valid. Apply bounded exponential backoff + jitter. Emit retry events without secrets.
+* Retry policy and classification
+
+Automatic retry is allowed only when policy and failure stage make it safe.
+
+| Failure point | Default replay decision |
+|---------------+-------------------------|
+| DNS/connect before request bytes | retryable |
+| TLS handshake before request bytes | retryable only for transient failures, never certificate validation failure |
+| 429 before semantic response | policy-controlled; honor Retry-After |
+| selected 5xx before semantic response | policy-controlled |
+| write failure after partial unknown request transmission | ambiguous; no default transparent retry |
+| any stream delta already exposed | no transparent retry |
+| embedding request before response | retryable under bounded policy |
+| structured output validation after successful response | no transport retry by default |
+
+Representative classifier:
+
+#+begin_src lisp
+(defun classify-openrouter-retry (failure request-state policy)
+  (cond
+    ((cancelled-p request-state) :never)
+    ((deadline-expired-p request-state) :never)
+    ((semantic-output-emitted-p request-state) :never)
+    ((certificate-verification-failure-p failure) :never)
+    ((rate-limit-error-p failure) :after-delay)
+    ((safe-prewrite-transport-failure-p failure) :retry)
+    (t :never)))
+#+end_src
+
+Honor =Retry-After= where valid. Apply bounded exponential backoff + jitter while clamping every sleep to the absolute request deadline.
+
+Retry attempts emit metadata/events such as attempt number and sanitized reason. Secrets and raw Authorization headers never appear.
+
+* Retry identity
+
+One logical model invocation has one llm-agent request id even if multiple HTTP attempts occur. Each transport attempt gets its own attempt id.
+
+#+begin_src text
+logical request req-42
+   |
+   +-- attempt 1 -> connect error
+   +-- attempt 2 -> HTTP 429
+   +-- attempt 3 -> success
+#+end_src
+
+This prevents retries from looking like multiple model invocations in traces/checkpoints while still preserving attempt diagnostics.
 
 * Errors
 
@@ -189,15 +525,104 @@ Normalize:
 
 A partial-stream error includes already-observed usage/content metadata so applications can make informed decisions.
 
+Representative condition:
+
+#+begin_src lisp
+(define-condition openrouter-provider-error (llm:provider-error)
+  ((status :initarg :status :initform nil :reader openrouter-error-status)
+   (provider-code :initarg :provider-code :initform nil
+                  :reader openrouter-error-code)
+   (request-id :initarg :request-id :initform nil
+               :reader openrouter-error-request-id)))
+#+end_src
+
+Raw response bodies are bounded/redacted before being attached to diagnostics.
+
 * Capability cache
 
 Cache Models API records per base URL/credentials visibility context with fetched-at timestamp and configurable TTL. Expose force-refresh and no-cache modes. Capability decisions record whether they came from cache, live model profile or caller override.
+
+Representative cache key:
+
+#+begin_src lisp
+(list :base-uri normalized-base-uri
+      :model-id model-id
+      :visibility-scope credential-scope-id)
+#+end_src
+
+Never use the secret credential itself as a cache key or printable value.
+
+Capability cache lookup returns both profile and freshness state:
+
+#+begin_src lisp
+(multiple-value-bind (profile freshness)
+    (lookup-model-profile cache model-id)
+  ;; freshness = :fresh, :stale, :miss
+  ...)
+#+end_src
+
+* Embeddings mapping
+
+Canonical embedding protocol returns a result containing vectors, model/provider identity, dimensions, usage and extensions.
+
+#+begin_src lisp
+(defmethod llm.embedding:embed-documents ((client openrouter-client)
+                                          texts
+                                          &key context options)
+  ;; POST /embeddings, validate vector count and dimensions, normalize usage.
+  ...)
+#+end_src
+
+Response validation requirements:
+
+- returned item count equals requested item count;
+- indices are unique/in-range if provider uses indices;
+- every vector has the same expected dimension;
+- numeric values are finite;
+- model/provider identity is preserved;
+- malformed vectors fail before a vector store can mutate.
 
 * Live and deterministic tests
 
 Deterministic fixtures cover request JSON, ordinary responses, every-byte SSE fragmentation, keepalives, tool deltas, structured output, mid-stream errors, usage and retry classification.
 
 Transport conformance runs the same local fixture server behavior through Dexador and hardened Carrier where semantics overlap.
+
+** Every-boundary SSE test
+
+#+begin_src lisp
+(test sse-partition-invariance
+  (let* ((wire (utf8-octets sample-sse-response))
+         (expected (decode-sse-in-one-chunk wire)))
+    (loop for split from 0 to (length wire)
+          do (is (equal expected
+                        (decode-sse-in-two-chunks wire split))))))
+#+end_src
+
+A property test should also generate multi-chunk partitions and multibyte UTF-8 boundaries.
+
+** Tool interleave test
+
+#+begin_src lisp
+(test interleaved-tool-call-deltas-remain-correlated
+  (let ((events (run-stream-fixture interleaved-two-tool-calls)))
+    (is (equal '("call-a" "call-b")
+               (ready-tool-call-ids events)))
+    (is (equal '(("city" . "Columbus"))
+               (tool-call-arguments events "call-a")))))
+#+end_src
+
+** Cancellation race test
+
+#+begin_src lisp
+(test cancellation-wins-terminal-race
+  (let ((run (make-controllable-stream-run)))
+    (emit-provider-delta run "hello")
+    (cancel-run run :user)
+    (emit-provider-complete run)
+    (is (eq :cancelled (run-terminal-state run)))
+    (is (= 1 (run-terminal-transition-count run)))))
+#+end_src
 
 Credential-gated OpenRouter tests cover:
 
@@ -211,6 +636,29 @@ Credential-gated OpenRouter tests cover:
 
 Live tests have strict token/cost budgets and are never required for contributors without credentials; deterministic CI remains mandatory.
 
+* Implementation slices
+
+1. provider package/config/client + request JSON mapping fixtures;
+2. standalone incremental SSE decoder + fuzz/fragmentation suite;
+3. non-stream chat/result normalization over Dexador;
+4. stream assembler, text/usage/tool-call deltas and terminal arbiter;
+5. structured output capability/validation path;
+6. Models capability cache;
+7. embeddings single/batch;
+8. retry classifier/backoff observability;
+9. hardened Carrier async adapter after Design 006 required slices are released;
+10. transport conformance + credential-gated live smoke suite.
+
+Async integration must not block secure Carrier hardening; sync provider functionality can land first behind the shared semantics.
+
+* Open design questions for maintainer approval
+
+1. Exact names of canonical stream event kinds; this design recommends reusing Design 001 =:content-delta= plus subtype metadata instead of provider-specific =:text-delta= classes.
+2. Default capability policy when model metadata is missing/stale: this design recommends =:attempt= for ordinary chat and =:require-known= only when caller explicitly requests strict preflight.
+3. Default retry count/backoff envelope; should be conservative and deadline-bounded.
+4. Whether raw provider chunks can be enabled in debug events; if yes, they must be opt-in, bounded and redacted.
+5. Whether sync streaming through Dexador is required in the first provider PR or may land immediately after non-stream sync while SSE/Carrier work continues.
+
 * Related research/design
 
 - [[id:llm-agent-research-002][OpenRouter research]]
@@ -223,9 +671,12 @@ Live tests have strict token/cost budgets and are never required for contributor
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
+| 2026-08-12 | Expanded request mapping, SSE decoder/assembler, tool delta correlation, terminal race, retry identity, embeddings validation and concrete tests. | GPT-5.6 Sol | Design review pass |
 | 2026-08-12 | Created OpenRouter, transport, SSE, structured-output and embedding provider design. | GPT-5.6 Sol | Research 002/003/007 and current OpenRouter docs |
 
 * Footnotes and Glossary
 
 - *Capability cache*: time-bounded local model metadata used to reject/route incompatible requests before dispatch.
 - *Terminal-state race*: competition between completion, failure, cancellation and timeout callbacks; exactly one may win.
+- *Semantic output emitted*: any canonical stream event whose replay could be observed by application logic, excluding internal diagnostics.
+- *Attempt id*: identity of one HTTP try within one logical model invocation.
