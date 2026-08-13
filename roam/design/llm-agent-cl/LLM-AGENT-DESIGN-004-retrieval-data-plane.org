@@ -13,7 +13,23 @@
 | Retrieval protocol/API shape | Maintainer | PENDING | Review this design | Research 008 |
 | First built-in integration scope | Maintainer | PENDING | Review loader/splitter/vector-store list | This design |
 | OpenRouter embeddings integration | Maintainer | PENDING | Review provider mapping | Design 002 |
+| Vector scoring/filter semantics | Maintainer | PENDING | Review concrete contracts below | This design |
 | Implementation authorization | Maintainer | NOT STARTED | Explicit approval | None |
+
+* Goal and invariants
+
+Retrieval is a first-major-milestone package family, not deferred optional work. The design must support standalone retrieval, graph nodes, agent tools and direct RAG composition without forcing one database/vector backend.
+
+Invariants:
+
+1. Documents/chunks preserve source provenance.
+2. Loader/splitter/embedding/vector-store implementations sit behind project-owned protocols.
+3. Lazy paths are bounded and cancellation-aware.
+4. Embedding dimensionality is validated before store mutation.
+5. Similarity score meaning is explicit and backend-normalized where possible.
+6. Metadata filters never silently change meaning when a backend cannot push them down.
+7. Deterministic reference backends exist for tests and small workloads.
+8. Retrieval never implicitly mutates the model prompt; applications/agents decide how retrieved context is consumed.
 
 * Systems
 
@@ -30,6 +46,21 @@ Proposed separately loadable systems:
 
 Provider-specific embedding adapters remain in provider systems but implement the common embedding protocol.
 
+#+begin_src text
+source -> loader -> documents -> splitter -> chunks
+                                      |
+                                      v
+                                 embedding model
+                                      |
+                                      v
+                                  vector store
+                                      |
+query -> retriever -------------------+
+   |
+   v
+ordered retrieval results -> tool / graph node / RAG helper
+#+end_src
+
 * Document
 
 Canonical =document= fields:
@@ -42,15 +73,56 @@ Canonical =document= fields:
 - =provenance= — loader/source/chunk parent information;
 - extension map for loader-specific data.
 
-Document equality/id semantics should not silently hash all content. Applications may supply ids; loaders may derive deterministic ids from stable source records when appropriate.
+Representative shape:
+
+#+begin_src lisp
+(defclass document ()
+  ((id :initarg :id :initform nil :reader document-id)
+   (page-content :initarg :page-content :reader document-page-content)
+   (metadata :initarg :metadata :initform nil :reader document-metadata)
+   (source :initarg :source :initform nil :reader document-source)
+   (mime-type :initarg :mime-type :initform "text/plain"
+              :reader document-mime-type)
+   (provenance :initarg :provenance :initform nil
+               :reader document-provenance)
+   (extensions :initarg :extensions :initform nil
+               :reader document-extensions)))
+#+end_src
+
+Document equality/id semantics do not silently hash all content. Applications may supply ids; loaders may derive deterministic ids from stable source records where appropriate.
+
+** Provenance
+
+A chunk produced from a parent document carries at least parent id/source and chunk ordinal/range where known:
+
+#+begin_src lisp
+'((:parent-id . "manual.txt")
+  (:source . "file:///docs/manual.txt")
+  (:chunk-index . 17)
+  (:start-offset . 8021)
+  (:end-offset . 8610))
+#+end_src
+
+Derived chunks must not lose the parent metadata needed to trace a model answer back to source material.
 
 * Loader protocol
 
-Generic operations:
+#+begin_src lisp
+(defclass document-loader () ())
 
-- =load-documents(loader, context)= -> list/vector of documents;
-- =lazy-load-documents(loader, context)= -> bounded iterator/event source;
-- async equivalents resolving project futures/event sources.
+(defgeneric load-documents (loader &key context))
+(defgeneric lazy-load-documents (loader &key context))
+(defgeneric load-documents-async (loader &key context))
+#+end_src
+
+Contracts:
+
+- eager load returns an ordered sequence of =document=;
+- lazy load returns a Design 001 bounded channel/iterator whose terminal state is explicit;
+- async eager load returns a project-owned future resolving to the same document sequence;
+- loader failures are typed retrieval/loader conditions;
+- cancellation/deadline comes from runtime context;
+- eager and lazy outputs preserve the same logical order for deterministic sources.
 
 Loader constructors hold source-specific configuration but never global credentials invisibly. Network loaders use runtime/transport configuration.
 
@@ -58,9 +130,27 @@ Initial built-ins:
 
 **Text loader** — wrap supplied string/text with metadata.
 
+#+begin_src lisp
+(load-documents
+ (make-text-loader "hello" :metadata '((:kind . :example))))
+#+end_src
+
 **File loader** — load text files with explicit encoding (UTF-8 default) and source path metadata; size ceilings required.
 
+#+begin_src lisp
+(make-file-loader #P"README.md"
+                  :encoding :utf-8
+                  :max-bytes (* 8 1024 1024))
+#+end_src
+
 **JSON loader** — parse Jzon values and use a caller-provided extraction path/function to map records/content/metadata.
+
+#+begin_src lisp
+(make-json-loader #P"records.json"
+                  :records-path '("items")
+                  :content-function (lambda (row) (gethash "text" row))
+                  :metadata-function #'json-row-metadata)
+#+end_src
 
 **CSV loader** — row-per-document and whole-file modes with header metadata.
 
@@ -70,9 +160,31 @@ Initial built-ins:
 
 Binary/PDF/office loaders are extension integrations unless a safe maintained dependency is explicitly selected later. The protocol must accommodate them without core redesign.
 
+* Lazy loader flow control
+
+#+begin_src text
+source producer
+    |
+    v
+bounded document channel
+    |
+    +-- consumer receives -> continue
+    +-- queue full -> producer backpressure
+    +-- cancel/deadline -> producer cleanup + terminal event
+#+end_src
+
+No loader may hide an unbounded accumulator behind a “lazy” API.
+
 * Splitter protocol
 
 A splitter accepts documents or text and returns ordered document chunks with parent provenance.
+
+#+begin_src lisp
+(defclass text-splitter () ())
+
+(defgeneric split-text (splitter text &key metadata context))
+(defgeneric split-documents (splitter documents &key context))
+#+end_src
 
 Common config:
 
@@ -90,39 +202,108 @@ Initial implementations:
 - token-aware splitter using tokenizer protocol;
 - generic structure-aware extension hook.
 
-Chunking must guarantee forward progress even when one unit exceeds chunk size. Overlap must be bounded below chunk size unless an explicit strategy supports otherwise.
+** Splitter safety invariants
+
+For every non-empty input:
+
+1. every iteration consumes positive input or terminates;
+2. =overlap < chunk-size= unless a custom strategy explicitly proves forward progress;
+3. produced chunk count is bounded by configured maximum;
+4. chunk order follows source order;
+5. provenance maps each output back to its parent.
+
+Representative constructor:
+
+#+begin_src lisp
+(make-recursive-character-splitter
+ :chunk-size 1200
+ :overlap 120
+ :separators '("\n\n" "\n" " " "")
+ :max-chunks 100000)
+#+end_src
+
+Chunking must guarantee forward progress even when one unit exceeds chunk size.
 
 * Tokenizer protocol
 
-Do not couple splitters to one model tokenizer package. Define:
+Do not couple splitters to one model tokenizer package.
 
-- count tokens;
-- encode/decode where backend supports it;
-- model/tokenizer identity.
+#+begin_src lisp
+(defclass tokenizer () ())
+
+(defgeneric token-count (tokenizer text))
+(defgeneric encode-tokens (tokenizer text))
+(defgeneric decode-tokens (tokenizer tokens))
+(defgeneric tokenizer-identity (tokenizer))
+#+end_src
 
 A simple approximate/default character length function remains usable without tokenizer integrations.
 
 * Embedding protocol
 
-Operations:
+#+begin_src lisp
+(defclass embedding-model () ())
 
-- =embed-query=;
-- =embed-documents=;
-- batch-aware sync/async variants;
-- optional dimensions/input-type/provider extensions.
+(defgeneric embed-query (model text &key context options))
+(defgeneric embed-documents (model texts &key context options))
+(defgeneric embed-query-async (model text &key context options))
+(defgeneric embed-documents-async (model texts &key context options))
+#+end_src
 
-Result carries vectors plus model/provider identity, dimensions, usage and metadata. Validate vector dimensions before inserting into stores.
+Result carries vectors plus model/provider identity, dimensions, usage and metadata.
+
+#+begin_src lisp
+(defclass embedding-result ()
+  ((vectors :initarg :vectors :reader embedding-result-vectors)
+   (dimensions :initarg :dimensions :reader embedding-result-dimensions)
+   (model :initarg :model :reader embedding-result-model)
+   (provider :initarg :provider :reader embedding-result-provider)
+   (usage :initarg :usage :initform nil :reader embedding-result-usage)
+   (extensions :initarg :extensions :initform nil
+               :reader embedding-result-extensions)))
+#+end_src
+
+Validation before returning a successful result:
+
+- vector count equals input count;
+- dimensions are positive and equal for every vector;
+- all numeric elements are finite;
+- dimensions match requested/declared dimension where applicable;
+- total element count obeys configured resource bounds.
 
 OpenRouter is the first remote implementation. Embedding requests reuse provider auth/config/model discovery from Design 002.
 
+* Embedding batching
+
+Batching is explicit because provider limits vary.
+
+#+begin_src lisp
+(embed-documents model texts
+                 :options (make-embedding-options
+                           :batch-size 64
+                           :max-concurrency 4))
+#+end_src
+
+The adapter may reduce a requested batch size to provider limits but must not exceed caller hard limits. Result order always matches input order even if batches execute concurrently.
+
 * Embedding cache
 
-A cache wrapper decorates any embedding model. Cache key includes:
+A cache wrapper decorates any embedding model.
+
+Cache key includes:
 
 - embedding model/provider identity;
-- relevant embedding options/dimension;
+- relevant embedding options/dimension/input type;
 - normalized input bytes/text hash;
 - cache schema version.
+
+#+begin_src lisp
+(defun embedding-cache-key (model options text)
+  (list :version 1
+        :model (embedding-model-identity model)
+        :options (embedding-cache-relevant-options options)
+        :input-sha256 (sha256-utf8 text)))
+#+end_src
 
 Document and query caching may use separate namespaces because providers can distinguish input types. Cache values include vector and necessary identity metadata. Never cache secrets/provider headers.
 
@@ -130,11 +311,14 @@ Document and query caching may use separate namespaces because providers can dis
 
 Generic key/value store operations:
 
-- =mget(namespace, keys)=;
-- =mset(namespace, pairs)=;
-- =mdelete(namespace, keys)=;
-- =yield-keys(namespace, prefix)=;
-- async equivalents where backend supports them.
+#+begin_src lisp
+(defclass byte-store () ())
+
+(defgeneric store-mget (store namespace keys &key context))
+(defgeneric store-mset (store namespace pairs &key context))
+(defgeneric store-mdelete (store namespace keys &key context))
+(defgeneric store-yield-keys (store namespace &key prefix context))
+#+end_src
 
 Keys are strings/octet keys with a documented normalized representation. Values are caller-defined serializable values/octets at this layer.
 
@@ -142,19 +326,46 @@ Initial in-memory store is lock-safe and deterministic. Persistent adapters rema
 
 * Vector-store protocol
 
-Canonical methods:
+#+begin_src lisp
+(defclass vector-store () ())
 
-- add/upsert documents/texts with optional ids;
-- add vectors directly with associated documents;
-- delete ids;
-- similarity search by text/query;
-- similarity search by vector;
-- scored search;
-- metadata filtering;
-- optional max-marginal-relevance later if required by parity closure;
-- async variants.
+(defgeneric vector-store-add (store documents &key ids vectors context))
+(defgeneric vector-store-delete (store ids &key context))
+(defgeneric similarity-search (store query &key k filter context))
+(defgeneric similarity-search-vector (store vector &key k filter context))
+(defgeneric similarity-search-with-score (store query &key k filter context))
+#+end_src
 
-A vector store declares dimension, metric and embedding model requirements. Incompatible dimension insertion signals a typed error before mutating state.
+A vector store declares dimension, metric and embedding model requirements.
+
+#+begin_src lisp
+(defgeneric vector-store-dimension (store))
+(defgeneric vector-store-metric (store))
+#+end_src
+
+Incompatible dimension insertion signals a typed error before mutating state.
+
+* Search result and score semantics
+
+Backends return canonical retrieval results:
+
+#+begin_src lisp
+(defclass retrieval-result ()
+  ((document :initarg :document :reader retrieval-result-document)
+   (score :initarg :score :initform nil :reader retrieval-result-score)
+   (rank :initarg :rank :reader retrieval-result-rank)
+   (metadata :initarg :metadata :initform nil :reader retrieval-result-metadata)))
+#+end_src
+
+Canonical =score= means “larger is more similar/relevant” for the standard vector-store API.
+
+Reference normalization:
+
+- cosine similarity -> cosine value, larger better;
+- dot product -> dot value, larger better;
+- Euclidean distance -> convert to a documented monotonic similarity such as =1 / (1 + distance)=, while preserving raw distance in metadata.
+
+Backends whose native score cannot be normalized reliably must expose the raw score/metric in metadata and either implement the canonical ordering contract or use a backend-specific advanced method. Do not mix “smaller is better” and “larger is better” behind one method silently.
 
 * In-memory vector store
 
@@ -166,30 +377,61 @@ Required metrics:
 - dot product;
 - Euclidean distance converted/documented as ranking score.
 
-Search is deterministic under ties (stable document id/insertion order rule). This backend is for correctness/tests/small workloads, not a claim of production ANN scalability.
+Representative construction:
+
+#+begin_src lisp
+(let ((store (make-memory-vector-store
+              :dimension 1536
+              :metric :cosine
+              :embedding-model embeddings
+              :max-vectors 100000)))
+  (vector-store-add store docs)
+  (similarity-search store "Common Lisp agents" :k 8))
+#+end_src
+
+Search is deterministic under ties using stable id, falling back to insertion ordinal when ids are absent.
+
+This backend is for correctness/tests/small workloads, not a claim of production ANN scalability.
 
 * Portable filters
 
-First filter language should support a conservative portable subset:
+First filter language supports a conservative portable AST:
 
-- equality/inequality;
-- numeric/string comparisons;
-- membership;
-- AND/OR/NOT;
-- metadata key existence.
+#+begin_src lisp
+(:and
+  (:= :source "manual")
+  (:>= :year 2025)
+  (:in :language ("en" "fr"))
+  (:exists :author))
+#+end_src
 
-Backends can translate supported filters or fall back to post-filtering when explicitly allowed. Unsupported filter operators signal rather than silently changing semantics.
+Operators:
+
+- =:=, =:/==;
+- numeric/string =:< :<= :> :>==;
+- =:in= / =:not-in=;
+- =:and :or :not=;
+- =:exists=.
+
+Backend behavior is explicit:
+
+- =:pushdown-required= -> signal if backend cannot implement filter natively;
+- =:post-filter-allowed= -> backend may retrieve a bounded candidate set then apply canonical filter locally;
+- =:unsupported= -> typed failure.
+
+Post-filtering must expose the candidate expansion policy/limit; it cannot scan an unbounded remote store invisibly.
 
 * Retriever protocol
 
-Retriever invocation maps a query/input to ordered documents and optional relevance metadata.
+Retriever invocation maps a query/input to ordered retrieval results/documents.
 
-Methods:
+#+begin_src lisp
+(defclass retriever () ())
 
-- sync invoke;
-- async invoke;
-- bounded batch/async batch;
-- optional stream only for retrievers that naturally support progressive results; not required for vector retrieval.
+(defgeneric retrieve (retriever query &key context options))
+(defgeneric retrieve-async (retriever query &key context options))
+(defgeneric retrieve-batch (retriever queries &key context options))
+#+end_src
 
 Implementations:
 
@@ -197,27 +439,95 @@ Implementations:
 - callable/function retriever adapter;
 - composed retriever hooks for later FTS/graph/SQL systems.
 
+Representative vector retriever:
+
+#+begin_src lisp
+(let ((retriever (make-vector-store-retriever
+                  store
+                  :k 6
+                  :filter '(:= :project "llm-agent-cl"))))
+  (retrieve retriever "checkpoint semantics"))
+#+end_src
+
+Optional stream is only for retrievers that naturally support progressive results; vector retrieval does not need fake streaming.
+
 * RAG helpers
 
-Provide composable helpers rather than a mandatory “RAG chain” object:
+Provide composable helpers rather than a mandatory opaque “RAG chain” object:
 
 - retrieve context;
 - format documents with configurable separator/template;
 - attach source metadata/citations to runtime state;
 - create retriever-as-tool;
 - create retrieval graph node;
-- convenience =retrieve-and-generate= can be layered above these protocols.
+- convenience =retrieve-and-generate= layered above these protocols.
+
+** Direct composition
+
+#+begin_src lisp
+(let* ((results (retrieve retriever question))
+       (context-text (format-retrieval-context results
+                                               :include-source t))
+       (messages (list
+                  (make-system-message "Answer using supplied context.")
+                  (make-user-message
+                   (format nil "Context:~%~A~%~%Question: ~A"
+                           context-text question)))))
+  (invoke-model model messages))
+#+end_src
+
+** Retriever as tool
+
+#+begin_src lisp
+(make-retriever-tool
+ :name "search_docs"
+ :retriever retriever
+ :description "Search project documentation")
+#+end_src
+
+** Retriever as graph node
+
+#+begin_src lisp
+(defun retrieval-node (state context)
+  (let ((results (retrieve (context-dependency context :retriever)
+                           (state-ref state :query)
+                           :context context)))
+    `((:retrieved-documents . ,results))))
+#+end_src
 
 This lets retrieval work standalone, in a tool-calling agent, or in a graph.
 
 * Concurrency and resource limits
 
-- loader response/file size ceilings;
-- maximum document/chunk counts per operation;
-- bounded embedding batch size/concurrency;
-- cancellation/deadline propagation;
-- vector dimension/vector-count guardrails for in-memory store;
-- no unbounded lazy-loader buffering.
+Explicit bounds include:
+
+- loader response/file bytes;
+- maximum documents per load;
+- maximum chunks per input/operation;
+- maximum individual document/chunk bytes;
+- embedding batch size/concurrency;
+- maximum embedding dimensions/total vector elements;
+- vector count for in-memory store;
+- retrieval =k= maximum;
+- post-filter candidate expansion;
+- lazy-loader channel capacity;
+- deadline/cancellation.
+
+Constructors reject invalid limits early. No dangerous dimension should interpret zero as unlimited implicitly.
+
+* Failure semantics
+
+Typed retrieval conditions should distinguish at least:
+
+- loader source/read/encoding/content-type/size failure;
+- splitter invalid configuration/non-progress/limit failure;
+- embedding provider/dimension/value failure;
+- cache corruption/version mismatch;
+- store failure;
+- vector dimension/metric/filter failure;
+- retriever failure.
+
+Store mutation APIs should validate all input vectors/documents first where practical so one malformed element does not produce an accidental partial insert. Backends that cannot provide atomic batch mutation must document partial-write behavior explicitly.
 
 * Tests
 
@@ -225,14 +535,101 @@ Required tests:
 
 - document metadata/provenance preservation;
 - loader happy/error/size/encoding paths;
+- eager/lazy logical-order equivalence;
 - splitter boundary/overlap/non-progress fuzz cases;
 - embedding dimension/usage normalization and cache hits/misses;
+- concurrent embedding batches preserve input order;
 - store batch/thread behavior;
 - exact vector metric ranking/filtering/ties;
+- canonical score orientation across all reference metrics;
+- filter pushdown/post-filter policy;
 - retriever sync/async/batch;
 - end-to-end minimal RAG with deterministic fake embeddings/model;
 - optional live OpenRouter embedding test with strict budget;
-- use retrieval as graph node and as canonical tool.
+- retrieval as graph node and canonical tool.
+
+** Provenance test
+
+#+begin_src lisp
+(test splitter-preserves-parent-provenance
+  (let* ((doc (make-instance 'document
+                             :id "doc-1"
+                             :page-content long-text
+                             :source "file:///doc.txt"))
+         (chunks (split-documents splitter (list doc))))
+    (is (every (lambda (chunk)
+                 (equal "doc-1"
+                        (cdr (assoc :parent-id
+                                    (document-provenance chunk)))))
+               chunks))))
+#+end_src
+
+** Dimension preflight test
+
+#+begin_src lisp
+(test vector-store-rejects-bad-dimension-before-mutation
+  (let ((store (make-memory-vector-store :dimension 3 :metric :cosine)))
+    (signals vector-dimension-error
+      (vector-store-add store
+                        (list doc-a doc-b)
+                        :vectors #(#(1d0 2d0 3d0)
+                                   #(1d0 2d0))))
+    (is (= 0 (vector-store-count store)))))
+#+end_src
+
+** Score orientation test
+
+#+begin_src lisp
+(test all-reference-scores-sort-larger-is-better
+  (dolist (metric '(:cosine :dot :euclidean))
+    (let ((results (fixture-search metric)))
+      (is (apply #'>= (mapcar #'retrieval-result-score results))))))
+#+end_src
+
+* Implementation slices
+
+1. =document= + provenance + typed retrieval conditions;
+2. loader protocol + text/file/JSON/CSV deterministic loaders;
+3. splitter/tokenizer protocols + character/recursive implementations;
+4. embedding protocol/result + deterministic fake model;
+5. OpenRouter embedding adapter + cache wrapper;
+6. byte/key-value store protocol + in-memory backend;
+7. vector-store protocol + exact in-memory backend/metrics;
+8. portable filter AST/policies;
+9. retriever protocol + vector-store retriever;
+10. RAG/tool/graph composition helpers;
+11. HTTP/HTML loaders after common transport is stable;
+12. parity closure and additional integrations required by tests.
+
+* Rejected alternatives
+
+** Couple documents to one vector database schema
+
+Rejected because document provenance/loaders/retrievers must remain useful independently of a specific persistence backend.
+
+** Return raw provider embedding JSON
+
+Rejected because callers and vector stores need stable ordered vectors/dimension/usage semantics.
+
+** Treat vector scores as backend-native opaque numbers in the common API
+
+Rejected because opposite score orientations cause subtle ranking bugs. Canonical common search uses larger-is-better semantics.
+
+** Silently post-filter unsupported metadata expressions
+
+Rejected because candidate expansion can alter performance/recall drastically. Post-filtering requires explicit policy and bounds.
+
+** Build one monolithic RAG chain abstraction first
+
+Rejected because the required capability class is composable loaders/splitters/embeddings/stores/retrievers usable by graphs/tools as well as simple RAG.
+
+* Open design questions for maintainer approval
+
+1. Canonical document text slot name. Keep =page-content= for LangChain familiarity or prefer =content=. Recommendation: export =document-content= accessor even if internal slot remains page-content.
+2. First persistent store/vector integration after in-memory reference. Do not select one until dependency/reliability work is justified.
+3. Exact Euclidean canonical similarity conversion. Recommendation: =1/(1+d)= because it is bounded, monotonic and simple; raw distance remains metadata.
+4. Whether vector-store =add= computes embeddings automatically when an embedding model is configured, or require distinct =add-documents= and =add-vectors=. Recommendation: distinct explicit methods plus ergonomic convenience wrapper.
+5. Whether HTML extraction dependency belongs in the first retrieval implementation slice. Protocol is required; concrete dependency can land after core deterministic pieces.
 
 * Related research/design
 
@@ -245,6 +642,7 @@ Required tests:
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
+| 2026-08-12 | Expanded document/loader/splitter/embedding/vector/retriever APIs, provenance, scoring/filter semantics, RAG examples and tests. | GPT-5.6 Sol | Design review pass |
 | 2026-08-12 | Created first-major-milestone retrieval/data-plane design. | GPT-5.6 Sol | Research 001/008 and current LangChain retrieval docs |
 
 * Footnotes and Glossary
@@ -252,3 +650,4 @@ Required tests:
 - *ANN*: approximate nearest-neighbor search.
 - *Provenance*: information connecting a derived chunk/document to its originating source/document.
 - *Embedding cache*: store-backed decorator avoiding recomputation for identical model/options/input.
+- *Canonical similarity score*: normalized common score whose ordering is always larger-is-better.
