@@ -10,14 +10,32 @@
 
 | Approval area | Required authority | State | Evidence required | Evidence reference |
 |---------------+--------------------+-------+-------------------+--------------------|
-| Public package/API shape | Maintainer | PENDING | Review this design | None |
+| Public package/API shape | Maintainer | PENDING | Review this design | This document |
 | Configuration precedence | Maintainer | PENDING | Review explicit/default behavior | Research 002/006 |
-| Concurrency/dependency choices | Maintainer | PENDING | Review research 009 | None |
+| Concurrency/dependency choices | Maintainer | PENDING | Review concrete protocols below | Research 009 |
+| Canonical type ownership/mutability | Maintainer | PENDING | Review value contracts below | This document |
 | Implementation authorization | Maintainer | NOT STARTED | Explicit approval | None |
 
 * Goal
 
 Define a small, dependency-isolated Common Lisp foundation on which providers, graph execution, agents, retrieval and MCP can be built without allowing one transport/provider/framework dependency to dictate the public API.
+
+The design must be concrete enough that implementation can proceed without re-deciding core semantics while still leaving symbol spelling and minor constructor ergonomics adjustable before 1.0.
+
+* Design invariants
+
+These are architectural constraints, not suggestions:
+
+1. Third-party libraries implement mechanisms; =llm-agent-cl= owns semantics.
+2. No OpenRouter, Carrier, Blackbird, lparallel, StarIntel or MCP object appears in a core public signature.
+3. Sync and async APIs share canonical request/result/condition semantics.
+4. Cancellation is explicit, composable and idempotent.
+5. Deadlines are absolute monotonic deadlines internally.
+6. Stream events are library-owned values; provider wire chunks are adapter details.
+7. Secrets are redacted by construction and excluded from persistence by default.
+8. Process defaults are convenience configuration, never hidden conversation/runtime state.
+9. Resource ownership is explicit: whoever creates a runtime/executor/channel/client must be able to close it deterministically.
+10. Unknown provider-native fields are preserved through extension maps rather than silently discarded.
 
 * ASDF and package family
 
@@ -35,11 +53,98 @@ Proposed first-party systems:
 
 Provider, graph, MCP and retrieval implementations are separate systems described by sibling designs.
 
+** Dependency direction
+
+#+begin_src text
+                   llm-agent
+                       |
+        +--------------+--------------+
+        |              |              |
+   provider/tools    runtime      structured
+        |              |              |
+        +-------+------+-------+------+
+                |              |
+           transport        config
+                |              |
+                +------+-------+
+                       |
+                  concurrency
+                       |
+                      core
+
+external adapters:
+
+  Dexador ----------> transport
+  Carrier ----------> transport + concurrency bridge
+  OpenRouter -------> provider + transport
+  lparallel --------> concurrency executor backend
+  cl-jschema -------> structured validator backend
+  Jzon -------------> serialization boundary
+#+end_src
+
+The arrows mean “depends on.” Core must remain loadable without provider, transport, graph, retrieval or MCP implementations.
+
+** Representative ASDF split
+
+The exact file layout may change, but the dependency shape should resemble:
+
+#+begin_src lisp
+(asdf:defsystem "llm-agent/core"
+  :depends-on ("alexandria")
+  :components ((:file "packages")
+               (:file "core/values")
+               (:file "core/conditions")))
+
+(asdf:defsystem "llm-agent/concurrency"
+  :depends-on ("llm-agent/core"
+               "bordeaux-threads"
+               "lparallel")
+  :components ((:file "concurrency/cancellation")
+               (:file "concurrency/deadline")
+               (:file "concurrency/future")
+               (:file "concurrency/executor")
+               (:file "concurrency/channel")))
+
+(asdf:defsystem "llm-agent/config"
+  :depends-on ("llm-agent/core")
+  :components ((:file "config/secrets")
+               (:file "config/config")))
+#+end_src
+
+The umbrella =llm-agent= system may depend on the normal built-ins, but integrations remain individually loadable so consumers do not pull the entire ecosystem into the image.
+
 * Canonical value model
 
-Use CLOS classes/structures with constructors/accessors and documented immutability expectations rather than exposing dependency objects directly.
+Use CLOS classes or structures with constructors/accessors and documented ownership/immutability expectations rather than exposing dependency objects directly.
 
-**Messages**
+** Ownership and mutability rule
+
+Canonical request/result values are *logically immutable after publication*. Implementations may use mutable slots internally while constructing a value, but once a value is handed to another subsystem or emitted as an event, callers must not depend on destructive mutation.
+
+Mutable runtime state belongs in explicit runtime/executor/channel/checkpoint objects, not message/result values.
+
+The practical rule is:
+
+#+begin_src text
+builder/private object -> finalize -> canonical published value
+                                     |
+                                     +-> may be shared safely
+#+end_src
+
+If a later optimization requires destructive reuse, it must remain behind a backend boundary and preserve these observable semantics.
+
+** Extension maps
+
+Canonical objects that can cross provider/integration boundaries carry an extension map. Keys are namespaced to avoid collisions, for example:
+
+#+begin_src lisp
+'((:openrouter . ((:generation-id . "gen-123")))
+  (:vendor-x   . ((:reasoning-tier . "high"))))
+#+end_src
+
+Core APIs never require callers to understand these maps, but adapters must preserve unknown fields where preservation is safe and meaningful.
+
+** Messages
 
 A canonical message contains:
 
@@ -49,7 +154,43 @@ A canonical message contains:
 - provider-native extension map;
 - response/tool metadata where relevant.
 
-**Content blocks**
+Representative shape:
+
+#+begin_src lisp
+(defclass message ()
+  ((role
+    :initarg :role
+    :reader message-role)
+   (content
+    :initarg :content
+    :initform '()
+    :reader message-content)
+   (id
+    :initarg :id
+    :initform nil
+    :reader message-id)
+   (name
+    :initarg :name
+    :initform nil
+    :reader message-name)
+   (metadata
+    :initarg :metadata
+    :initform nil
+    :reader message-metadata)
+   (extensions
+    :initarg :extensions
+    :initform nil
+    :reader message-extensions)))
+
+(defun make-user-message (text)
+  (make-instance 'message
+                 :role :user
+                 :content (list (make-text-block text))))
+#+end_src
+
+Role validation occurs at construction/finalization time. Custom roles remain representable without making every provider support them.
+
+** Content blocks
 
 Minimum typed variants:
 
@@ -63,31 +204,178 @@ Minimum typed variants:
 - structured JSON/value;
 - provider-native block.
 
-Unknown provider content is preserved rather than silently dropped.
+Representative protocol:
 
-**Model result**
+#+begin_src lisp
+(defclass content-block () ())
+
+(defclass text-block (content-block)
+  ((text :initarg :text :reader text-block-text)))
+
+(defclass provider-block (content-block)
+  ((namespace :initarg :namespace :reader provider-block-namespace)
+   (payload :initarg :payload :reader provider-block-payload)))
+
+(defgeneric content-block-kind (block))
+
+(defmethod content-block-kind ((block text-block))
+  :text)
+#+end_src
+
+Unknown provider content is preserved rather than silently dropped. A provider adapter may decline to send an unknown block and signal =unsupported-capability=, but it must not mutate the caller's message to remove it.
+
+** Model result
 
 Contains output messages/content, finish reason, usage, model/provider identity, generation/request identifiers, structured result where requested, and provider-native metadata.
 
-**Usage**
+#+begin_src lisp
+(defclass model-result ()
+  ((messages :initarg :messages :reader result-messages)
+   (finish-reason :initarg :finish-reason :reader result-finish-reason)
+   (usage :initarg :usage :reader result-usage)
+   (provider :initarg :provider :reader result-provider)
+   (model :initarg :model :reader result-model)
+   (request-id :initarg :request-id :initform nil :reader result-request-id)
+   (generation-id :initarg :generation-id :initform nil :reader result-generation-id)
+   (structured-value :initarg :structured-value
+                     :initform nil
+                     :reader result-structured-value)
+   (extensions :initarg :extensions :initform nil :reader result-extensions)))
+#+end_src
 
-Normalize prompt/input, completion/output and total token counts when available, plus optional cached/reasoning/provider-specific counters and monetary metadata. Unknown counts remain unknown rather than zero.
+** Usage
 
-**Model profile**
+Normalize prompt/input, completion/output and total token counts when available, plus optional cached/reasoning/provider-specific counters and monetary metadata. Unknown counts remain =nil= rather than zero.
+
+#+begin_src lisp
+(defstruct (usage (:constructor make-usage
+                                (&key input-tokens output-tokens total-tokens
+                                      cached-tokens reasoning-tokens cost
+                                      extensions)))
+  input-tokens
+  output-tokens
+  total-tokens
+  cached-tokens
+  reasoning-tokens
+  cost
+  extensions)
+#+end_src
+
+A missing count and a measured zero are semantically different.
+
+** Model profile
 
 Normalized capability flags/limits: context length, input/output modalities, tools, parallel tools, structured output, reasoning, embeddings, max output and provider-native capabilities with observed/fetched timestamp.
 
-**Tool call/result**
+Capability values should support at least three states where needed: supported, unsupported, unknown. Absence from a stale provider cache must not become permanent “false.”
+
+#+begin_src lisp
+(defclass model-profile ()
+  ((model-id :initarg :model-id :reader profile-model-id)
+   (context-length :initarg :context-length :initform nil
+                   :reader profile-context-length)
+   (capabilities :initarg :capabilities :initform nil
+                 :reader profile-capabilities)
+   (observed-at :initarg :observed-at :reader profile-observed-at)
+   (extensions :initarg :extensions :initform nil
+               :reader profile-extensions)))
+
+(defun capability-state (profile capability)
+  ;; Returns :supported, :unsupported, or :unknown.
+  ...)
+#+end_src
+
+** Tool call/result
 
 Preserve stable call id, tool name, raw/validated arguments, result/error, content blocks and metadata.
+
+#+begin_src lisp
+(defclass tool-call ()
+  ((id :initarg :id :reader tool-call-id)
+   (name :initarg :name :reader tool-call-name)
+   (raw-arguments :initarg :raw-arguments :reader tool-call-raw-arguments)
+   (arguments :initarg :arguments :initform nil :reader tool-call-arguments)
+   (extensions :initarg :extensions :initform nil :reader tool-call-extensions)))
+
+(defclass tool-result ()
+  ((call-id :initarg :call-id :reader tool-result-call-id)
+   (content :initarg :content :initform '() :reader tool-result-content)
+   (value :initarg :value :initform nil :reader tool-result-value)
+   (condition :initarg :condition :initform nil :reader tool-result-condition)
+   (extensions :initarg :extensions :initform nil :reader tool-result-extensions)))
+#+end_src
 
 Canonical document/vector values are defined in Design 004 but use the same extension/provenance conventions.
 
 * Protocol style
 
-Public extensibility should use generic functions/protocol classes rather than implementation-specific conditionals. Protocols include model invocation, embeddings, transport execution, tool execution, schema validation, store operations and middleware.
+Public extensibility uses generic functions/protocol classes rather than implementation-specific conditionals. Protocols include model invocation, embeddings, transport execution, tool execution, schema validation, store operations and middleware.
 
 A protocol method may have sync and async entrypoints, but semantic result/error types are shared.
+
+** Provider-neutral model protocol
+
+Representative shape:
+
+#+begin_src lisp
+(defclass model-client () ())
+
+(defgeneric invoke-model (client messages &key context options))
+
+(defgeneric invoke-model-async (client messages &key context options))
+
+(defgeneric stream-model (client messages &key context options))
+
+(defgeneric model-profile (client &key refresh context))
+#+end_src
+
+Contracts:
+
+- =invoke-model= returns =model-result= or signals a typed condition;
+- =invoke-model-async= returns a project-owned =future= resolving to the same =model-result=;
+- =stream-model= returns a project-owned event source/channel;
+- cancellation/deadline lives in =context= rather than provider-specific keyword soup;
+- provider-only knobs live in =options= or namespaced extensions and cannot become mandatory core fields.
+
+** Transport protocol
+
+#+begin_src lisp
+(defclass transport () ())
+
+(defclass transport-request ()
+  ((method :initarg :method :reader request-method)
+   (uri :initarg :uri :reader request-uri)
+   (headers :initarg :headers :initform nil :reader request-headers)
+   (body :initarg :body :initform nil :reader request-body)
+   (response-mode :initarg :response-mode :initform :buffered
+                  :reader request-response-mode)))
+
+(defgeneric execute-request (transport request &key context))
+(defgeneric execute-request-async (transport request &key context))
+#+end_src
+
+Dexador and Carrier implement this contract. Neither transport object leaks into model results.
+
+** Sync/async semantic equivalence
+
+#+begin_src text
+invoke-model
+   | blocking wait
+   v
+model-result / typed condition
+
+invoke-model-async
+   |
+   v
+future ----------------------+
+   |                         |
+ resolve                     reject/cancel
+   |                         |
+   v                         v
+model-result          same typed condition family
+#+end_src
+
+Async must not invent a second result hierarchy. The difference is scheduling/waiting, not meaning.
 
 * Configuration model
 
@@ -102,6 +390,43 @@ For a setting such as provider key/model/base URL:
 5. documented environment variable fallback;
 6. library default or typed missing-config condition.
 
+** Concrete config shape
+
+#+begin_src lisp
+(defclass provider-config ()
+  ((provider :initarg :provider :reader config-provider)
+   (model :initarg :model :initform nil :reader config-model)
+   (api-key :initarg :api-key :initform nil :reader config-api-key)
+   (base-uri :initarg :base-uri :initform nil :reader config-base-uri)
+   (options :initarg :options :initform nil :reader config-options)))
+
+(defvar *scoped-config* nil)
+(defvar *process-default-config* nil)
+
+(defmacro with-default-config ((config) &body body)
+  `(let ((*scoped-config* ,config))
+     ,@body))
+#+end_src
+
+Dynamic scope is intentionally useful in the REPL and tests. Production callers can ignore it and pass explicit runtime/client config.
+
+** Inspectable resolution
+
+=resolve-config= should be able to return both the resolved value and non-secret provenance:
+
+#+begin_src lisp
+(multiple-value-bind (value source)
+    (resolve-config :api-key
+                    :explicit nil
+                    :client client-config
+                    :environment "OPENROUTER_API_KEY")
+  ;; SOURCE might be :CLIENT, :SCOPED, :PROCESS, :ENVIRONMENT, etc.
+  (declare (ignore value))
+  source)
+#+end_src
+
+For secret settings, debug inspection returns source/redacted information, never the secret payload.
+
 Expose conveniences such as:
 
 - =make-config= / =make-provider-config=;
@@ -113,7 +438,26 @@ Process defaults are caller-owned convenience state. Conversation/checkpoint his
 
 * Secret values
 
-Credentials use a secret wrapper/value policy whose printer displays redacted text. Conditions and event metadata must call redaction before rendering. Checkpoints/config serialization exclude secret material by default. A provider may resolve =OPENROUTER_API_KEY= at call/client construction time without storing it globally unless the caller intentionally asks to configure a default.
+Credentials use a secret wrapper/value policy whose printer displays redacted text. Conditions and event metadata must call redaction before rendering. Checkpoints/config serialization exclude secret material by default.
+
+Representative shape:
+
+#+begin_src lisp
+(defclass secret ()
+  ((value :initarg :value :reader %secret-value)))
+
+(defmethod print-object ((object secret) stream)
+  (print-unreadable-object (object stream :type t :identity nil)
+    (write-string "REDACTED" stream)))
+
+(defun reveal-secret (secret)
+  ;; Deliberately named operation used only at the adapter boundary.
+  (%secret-value secret))
+#+end_src
+
+=REVEAL-SECRET= should not be exported from the top-level convenience package unless there is a compelling reason. Provider/transport adapters can depend on the lower-level config package explicitly.
+
+A provider may resolve =OPENROUTER_API_KEY= at call/client construction time without storing it globally unless the caller intentionally configures a process default.
 
 * Runtime context
 
@@ -129,19 +473,93 @@ Each invocation receives a context containing optional:
 - event writer/stream sink;
 - arbitrary typed caller context/dependencies.
 
+Representative shape:
+
+#+begin_src lisp
+(defclass runtime-context ()
+  ((config :initarg :config :initform nil :reader context-config)
+   (cancellation :initarg :cancellation :initform nil
+                 :reader context-cancellation)
+   (deadline :initarg :deadline :initform nil :reader context-deadline)
+   (executor :initarg :executor :initform nil :reader context-executor)
+   (middleware :initarg :middleware :initform '() :reader context-middleware)
+   (event-sink :initarg :event-sink :initform nil :reader context-event-sink)
+   (dependencies :initarg :dependencies :initform nil
+                 :reader context-dependencies)))
+
+(defun child-context (parent &key cancellation deadline event-sink)
+  ;; Inherit stable dependencies while narrowing cancellation/deadline.
+  ...)
+#+end_src
+
 This is the bridge between explicit embeddability and convenient high-level APIs.
+
+Runtime context must not become an untyped dumping ground. Optional domain-specific dependencies should use stable keys/types and be documented by the subsystem consuming them.
 
 * Cancellation and deadlines
 
-**Cancellation token**
+** Cancellation token
 
 A token has atomic state, reason and callback registration. Cancelling is idempotent. Child tokens inherit parent cancellation. Transport, tool and graph tasks register cleanup/cancel hooks.
 
-**Deadline**
+State machine:
+
+#+begin_src text
+             cancel(reason)
+  ACTIVE ----------------------> CANCELLED
+    |                               |
+    | register callback             | register callback
+    v                               v
+ callback stored              callback runs immediately
+
+second/subsequent cancel -> no state change
+#+end_src
+
+Representative public API:
+
+#+begin_src lisp
+(defclass cancellation-token () ())
+
+(defun make-cancellation-token (&key parent)
+  ...)
+
+(defgeneric cancelled-p (token))
+(defgeneric cancellation-reason (token))
+(defgeneric cancel (token &optional reason))
+(defgeneric on-cancel (token function))
+
+(defun check-cancellation (token)
+  (when (and token (cancelled-p token))
+    (error 'operation-cancelled
+           :reason (cancellation-reason token))))
+#+end_src
+
+Callbacks must never run while holding internal token locks if doing so could deadlock user cleanup code. Implementations capture callbacks under lock, transition state once, then invoke callbacks outside the lock.
+
+** Deadline
 
 Represent absolute monotonic expiration rather than repeatedly recomputing relative timeouts. Child operations receive the minimum of parent and operation-specific deadline.
 
+#+begin_src lisp
+(defstruct deadline
+  monotonic-expiration)
+
+(defun make-deadline-after (seconds)
+  (make-deadline
+   :monotonic-expiration (+ (monotonic-now) seconds)))
+
+(defun derive-deadline (parent operation)
+  (cond ((null parent) operation)
+        ((null operation) parent)
+        (t (make-deadline
+            :monotonic-expiration
+            (min (deadline-monotonic-expiration parent)
+                 (deadline-monotonic-expiration operation))))))
+#+end_src
+
 Timeout conditions distinguish connect, read/idle, tool, checkpoint and overall execution where possible.
+
+Wall-clock timestamps remain useful for logs, but timeout correctness must use a monotonic clock abstraction.
 
 * Futures/results
 
@@ -153,11 +571,71 @@ Expose a project-owned future/promise protocol:
 - continuations/callback registration as a convenience;
 - exactly-once terminal transition.
 
+State machine:
+
+#+begin_src text
+                         resolve(value)
+                      +-----------------> RESOLVED
+                      |
+PENDING --------------+ reject(error) --> REJECTED
+                      |
+                      + cancel(reason) --> CANCELLED
+
+Any transition attempted after terminal state is ignored or reported according
+implementation/debug policy; observable completion remains exactly once.
+#+end_src
+
+Representative protocol:
+
+#+begin_src lisp
+(defclass future () ())
+
+(defgeneric future-state (future))
+(defgeneric await (future &key timeout cancellation))
+(defgeneric cancel-future (future &optional reason))
+(defgeneric on-complete (future function))
+
+(defun async-example (client messages context)
+  (let ((future (invoke-model-async client messages :context context)))
+    (on-complete future
+                 (lambda (state value)
+                   (declare (ignore state value))))
+    future))
+#+end_src
+
 Initial worker-backed implementation may use lparallel internally; Carrier adaptation may bridge Blackbird promises. Neither dependency class appears in public signatures.
+
+* Executor model
+
+Use an explicit executor object, initially backed by lparallel, for bounded CPU/blocking/concurrent tasks. Never assume a package-global lparallel kernel.
+
+Representative protocol:
+
+#+begin_src lisp
+(defclass executor () ())
+
+(defgeneric submit (executor function &key cancellation deadline))
+(defgeneric executor-shutdown (executor &key wait))
+(defgeneric executor-closed-p (executor))
+
+(let ((executor (make-worker-executor :workers 8 :queue-capacity 128)))
+  (unwind-protect
+       (await (submit executor
+                      (lambda () (expensive-work))))
+    (executor-shutdown executor :wait t)))
+#+end_src
+
+Runtime/client constructors may pick a process default executor for convenience, but the resolved executor is explicit in context.
+
+Carrier event-loop callbacks must not run arbitrary user tools or CPU-heavy middleware inline; dispatch them through an executor or graph scheduler.
 
 * Bounded event channels
 
-Streaming provider and graph operations need bounded producer/consumer channels or equivalent event-source objects. Required behavior:
+Streaming provider and graph operations need bounded producer/consumer channels or equivalent event-source objects.
+
+The channel should use an actor-like ownership model internally: queue state is owned by the channel; producers send values through its protocol rather than mutating queue storage directly. This does *not* introduce a StarIntel actor-system dependency.
+
+Required behavior:
 
 - bounded queue capacity;
 - producer backpressure policy;
@@ -167,6 +645,42 @@ Streaming provider and graph operations need bounded producer/consumer channels 
 - async wait integration.
 
 Provider SSE chunk boundaries never define public stream-event boundaries.
+
+** Stream event model
+
+#+begin_src lisp
+(defclass stream-event ()
+  ((kind :initarg :kind :reader stream-event-kind)
+   (payload :initarg :payload :initform nil :reader stream-event-payload)
+   (metadata :initarg :metadata :initform nil :reader stream-event-metadata)))
+
+;; Representative kinds, extended by graph/provider layers:
+;; :message-start :content-delta :tool-call-delta :usage
+;; :message-complete :error :cancelled :complete
+#+end_src
+
+Terminal semantics:
+
+#+begin_src text
+OPEN -> :complete  -> CLOSED
+OPEN -> :error     -> CLOSED
+OPEN -> :cancelled -> CLOSED
+
+CLOSED -> any producer send = rejected/no-op according to internal API,
+                           never a second terminal event
+#+end_src
+
+** Backpressure
+
+Default production policy should block/suspend the producer or defer reads when capacity is exhausted rather than silently drop semantic events. Optional lossy policies may exist for explicitly non-semantic observability streams, never for model/tool/graph result streams.
+
+#+begin_src lisp
+(let ((events (make-event-channel :capacity 64 :overflow :block)))
+  (channel-send events (make-instance 'stream-event
+                                      :kind :content-delta
+                                      :payload "hel"))
+  (channel-receive events))
+#+end_src
 
 * Middleware/interceptors
 
@@ -181,6 +695,32 @@ Middleware can wrap/observe:
 - emitted events.
 
 Ordering is deterministic. Middleware receives a typed operation context and =next= continuation. It may transform request/result only within the declared protocol. Secret redaction applies before observability middleware.
+
+Representative interface:
+
+#+begin_src lisp
+(defclass middleware () ())
+
+(defgeneric call-with-middleware (middleware operation next context))
+
+(defmethod call-with-middleware ((mw timing-middleware)
+                                 operation next context)
+  (let ((started (monotonic-now)))
+    (unwind-protect
+         (funcall next operation context)
+      (record-duration mw (- (monotonic-now) started)))))
+#+end_src
+
+Pipeline order is explicit:
+
+#+begin_src text
+[mw-1, mw-2, mw-3]
+
+request  -> mw-1 -> mw-2 -> mw-3 -> backend
+result   <- mw-1 <- mw-2 <- mw-3 <- backend
+#+end_src
+
+If middleware wants retries, retries must remain visible through events/metadata and respect cancellation/deadline. Middleware cannot extend a deadline silently.
 
 * Condition hierarchy
 
@@ -199,19 +739,99 @@ Proposed root =llm-agent-error= with typed families:
 
 Conditions include machine-readable fields but safe reporters.
 
+Representative root and transport condition:
+
+#+begin_src lisp
+(define-condition llm-agent-error (error)
+  ((operation :initarg :operation :initform nil :reader error-operation)
+   (metadata :initarg :metadata :initform nil :reader error-metadata)))
+
+(define-condition transport-error (llm-agent-error)
+  ((uri :initarg :uri :initform nil :reader transport-error-uri)
+   (phase :initarg :phase :initform nil :reader transport-error-phase)
+   (cause :initarg :cause :initform nil :reader transport-error-cause)))
+
+(define-condition operation-cancelled (llm-agent-error)
+  ((reason :initarg :reason :reader cancellation-error-reason)))
+#+end_src
+
+Adapters translate dependency-native failures at the boundary:
+
+#+begin_src text
+Dexador condition -----+
+Carrier/Blackbird -----+--> transport-error/provider-error/etc.
+lparallel condition ---+
+
+No raw backend condition is required for callers to handle normal failures.
+#+end_src
+
+The original condition/cause may be retained in a non-secret internal slot or extension for debugging, but reporters must redact secrets and avoid dumping full request headers/bodies by default.
+
 * JSON and schema boundary
 
 Use =com.inuoe.jzon= initially for JSON parse/write. Use =cl-jschema= through a project-owned schema-validator protocol. Tool/provider code should pass self-contained schemas. Schema validation failures carry JSON pointer/path information where available.
 
-* Executor model
+Representative protocol:
 
-Use an explicit executor object, initially backed by lparallel, for bounded CPU/blocking/concurrent tasks. Never assume a package-global lparallel kernel. Runtime/client constructors may pick a process default executor for convenience, but the resolved executor is explicit in context.
+#+begin_src lisp
+(defclass schema-validator () ())
 
-Carrier event-loop callbacks should not run arbitrary user tools or CPU-heavy middleware inline; dispatch them appropriately.
+(defgeneric validate-schema-value (validator schema value &key context))
+
+(defgeneric schema-valid-p (validator schema value &key context))
+
+(let ((validator (make-default-schema-validator)))
+  (validate-schema-value
+   validator
+   '(("type" . "object")
+     ("required" . #("answer")))
+   value))
+#+end_src
+
+Remote schema fetching remains disabled by default. Backend replacement must not alter the public validation protocol.
+
+* Client/runtime composition
+
+The high-level client owns stable provider configuration and adapter references. Per-call context owns execution-scoped concerns.
+
+#+begin_src lisp
+(defclass client ()
+  ((model-client :initarg :model-client :reader client-model-client)
+   (config :initarg :config :reader client-config)
+   (executor :initarg :executor :initform nil :reader client-executor)
+   (middleware :initarg :middleware :initform '() :reader client-middleware)
+   (owned-resources :initarg :owned-resources :initform '()
+                    :reader client-owned-resources)))
+
+(defgeneric close-client (client))
+#+end_src
+
+Creation/ownership rule:
+
+- dependency injected by caller -> caller owns lifecycle unless explicitly transferred;
+- dependency created by =make-client= -> client owns and closes it;
+- child runtime/context -> borrows parent resources and must not double-close them.
+
+This avoids common REPL leaks while preserving explicit embedding.
+
+* Resource lifecycle design
+
+| Resource | Usually created by | Close/cancel operation | May be borrowed? |
+|----------+--------------------+------------------------+------------------|
+| client | caller | =close-client= | yes |
+| worker executor | runtime/client/caller | =executor-shutdown= | yes |
+| cancellation token | operation/caller | =cancel= | yes/parented |
+| event channel | stream operation | terminal event + close | yes consumer ref |
+| transport pool | transport/client | transport-specific close behind protocol | yes |
+| provider capability cache | provider client | client close/eviction | yes |
+
+Every public object that owns external resources must have deterministic cleanup. Finalizers may be defensive only; they are not the primary lifecycle mechanism.
 
 * Public API ergonomics
 
-Support both explicit production use and concise REPL use. Representative intended shape (names are design-level, not frozen):
+Support explicit production use, concise REPL use, and async/streaming use.
+
+** REPL convenience
 
 #+begin_src lisp
 (llm:configure-default :provider :openrouter
@@ -219,15 +839,165 @@ Support both explicit production use and concise REPL use. Representative intend
                        :api-key (uiop:getenv "OPENROUTER_API_KEY"))
 
 (llm:invoke "hello")
-
-(llm:with-config ((:provider :openrouter) (:model "..."))
-  (llm:stream "hello"))
-
-(let ((client (llm:make-client :provider :openrouter :api-key key)))
-  (llm:invoke client messages))
 #+end_src
 
-Exact symbols may be refined before 1.0, but all three usage modes must remain possible.
+** Dynamically scoped experiment
+
+#+begin_src lisp
+(llm:with-config ((:provider :openrouter)
+                  (:model "anthropic/claude-sonnet-4"))
+  (llm:invoke "compare these two approaches"))
+#+end_src
+
+** Explicit production client
+
+#+begin_src lisp
+(let* ((config (llm.config:make-provider-config
+                :provider :openrouter
+                :model "openai/gpt-5"
+                :api-key (llm.config:make-secret key)))
+       (executor (llm.concurrent:make-worker-executor
+                  :workers 8
+                  :queue-capacity 128))
+       (client (llm:make-client
+                :config config
+                :executor executor)))
+  (unwind-protect
+       (llm:invoke client
+                   (list (llm:make-user-message "hello")))
+    (llm:close-client client)
+    ;; Explicitly injected executor remains caller-owned.
+    (llm.concurrent:executor-shutdown executor :wait t)))
+#+end_src
+
+** Cancellation + deadline
+
+#+begin_src lisp
+(let* ((token (llm.concurrent:make-cancellation-token))
+       (context (llm.runtime:make-context
+                 :cancellation token
+                 :deadline (llm.concurrent:make-deadline-after 30)))
+       (future (llm:invoke-async client messages :context context)))
+  ;; Another thread/UI callback may call:
+  ;; (llm.concurrent:cancel token :user-request)
+  (llm.concurrent:await future :cancellation token))
+#+end_src
+
+** Streaming
+
+#+begin_src lisp
+(let ((stream (llm:stream client messages)))
+  (loop for event = (llm.concurrent:channel-receive stream)
+        until (member (llm:stream-event-kind event)
+                      '(:complete :error :cancelled))
+        do (when (eq (llm:stream-event-kind event) :content-delta)
+             (write-string (llm:stream-event-payload event)))))
+#+end_src
+
+Exact symbols may be refined before 1.0, but these usage modes and ownership semantics must remain possible.
+
+* Package export sketch
+
+This is intentionally illustrative, but implementation should converge on a similarly small surface rather than exporting backend internals.
+
+#+begin_src lisp
+(defpackage #:llm-agent.core
+  (:use #:cl)
+  (:export
+   #:message #:message-role #:message-content
+   #:content-block #:text-block
+   #:model-result #:result-messages #:result-usage
+   #:usage
+   #:llm-agent-error #:unsupported-capability))
+
+(defpackage #:llm-agent.concurrent
+  (:use #:cl #:llm-agent.core)
+  (:export
+   #:cancellation-token #:make-cancellation-token #:cancel #:cancelled-p
+   #:deadline #:make-deadline-after
+   #:future #:await #:future-state #:cancel-future
+   #:executor #:submit #:executor-shutdown
+   #:event-channel #:channel-send #:channel-receive))
+
+(defpackage #:llm-agent.runtime
+  (:use #:cl #:llm-agent.core #:llm-agent.concurrent)
+  (:export
+   #:runtime-context #:make-context #:child-context
+   #:middleware #:call-with-middleware))
+#+end_src
+
+Avoid giant “export everything” packages. The umbrella package should export common user-facing constructors/functions while advanced consumers can depend on narrower packages.
+
+* End-to-end core call path
+
+#+begin_src text
+caller
+  |
+  v
+resolve client + operation config
+  |
+  v
+construct/derive runtime context
+  |  cancellation + monotonic deadline + executor + middleware
+  v
+middleware pipeline
+  |
+  v
+provider protocol
+  |
+  v
+transport protocol ----------------------+
+  |                                      |
+  | backend-specific                     | translate failure
+  v                                      v
+Dexador / Carrier                  typed llm-agent condition
+  |
+  v
+provider decode/normalize
+  |
+  v
+canonical model-result / stream-events
+  |
+  v
+caller
+#+end_src
+
+At every boundary, backend-specific values are normalized before crossing upward.
+
+* Failure examples
+
+** Missing credential
+
+#+begin_src lisp
+(handler-case
+    (llm:invoke client "hello")
+  (llm:missing-credential (condition)
+    (format *error-output* "Missing credential for ~A~%"
+            (llm:error-operation condition))))
+#+end_src
+
+** Cancellation
+
+#+begin_src lisp
+(handler-case
+    (llm.concurrent:await future :cancellation token)
+  (llm:operation-cancelled (condition)
+    (declare (ignore condition))
+    :cancelled))
+#+end_src
+
+** Unsupported capability
+
+#+begin_src lisp
+(handler-case
+    (llm:invoke client messages
+                :options '(:structured-output schema))
+  (llm:unsupported-capability (condition)
+    ;; Caller may intentionally choose another model/provider.
+    (fallback condition)))
+#+end_src
+
+The library must not silently downgrade a semantically required capability such as strict structured output unless the caller explicitly selected a fallback policy.
 
 * Testing and compatibility
 
@@ -241,9 +1011,90 @@ Core tests must cover:
 - deadline inheritance;
 - bounded-channel backpressure and cancellation;
 - middleware ordering/failure behavior;
-- condition field/report stability.
+- condition field/report stability;
+- resource ownership and double-close idempotence;
+- dependency-native error translation;
+- sync/async semantic equivalence.
+
+** Representative race test
+
+#+begin_src lisp
+(test future-terminal-transition-is-exactly-once
+  (let ((future (make-test-future)))
+    (run-concurrently
+     (lambda () (resolve-test-future future :ok))
+     (lambda () (reject-test-future future
+                                    (make-condition 'test-error))))
+    (is (member (future-state future) '(:resolved :rejected)))
+    (is (= 1 (test-future-terminal-transition-count future)))))
+#+end_src
+
+** Representative config precedence test
+
+#+begin_src lisp
+(test explicit-config-beats-scoped-and-environment
+  (with-environment (("OPENROUTER_API_KEY" "env-key"))
+    (with-default-config ((make-provider-config :api-key "scoped-key"))
+      (multiple-value-bind (value source)
+          (resolve-config :api-key :explicit "explicit-key")
+        (is (string= "explicit-key" value))
+        (is (eq :explicit source))))))
+#+end_src
+
+The actual test framework can differ; the behavioral assertion is what matters.
 
 Initial reference runtime is SBCL. Public semantic versioning begins immediately; pre-1.0 breaking changes require changelog/migration notes.
+
+* Implementation slices for Design 001
+
+Implementation should be split into reviewable slices rather than one giant core commit:
+
+1. packages + root conditions + canonical content/message/result/usage values;
+2. secret/config objects + deterministic resolution;
+3. monotonic clock/deadline + cancellation token;
+4. project-owned future + worker executor adapter;
+5. bounded event channel + terminal semantics;
+6. runtime context + middleware pipeline;
+7. transport/provider protocol shells and dependency adapters needed by Design 002;
+8. lifecycle/conformance tests and umbrella convenience API.
+
+Each slice must land with tests before the next layer depends on it.
+
+* Rejected alternatives
+
+** Expose lparallel futures directly
+
+Rejected because it would make scheduling dependency semantics part of the public API and complicate Carrier/Blackbird integration.
+
+** Use Blackbird promise semantics as the universal async API
+
+Rejected because Carrier is a transport backend, not the semantic owner of graph/tool/worker concurrency.
+
+** One global runtime/kernel
+
+Rejected because embedders need multiple independent clients/runtimes, tests need isolation, and global shutdown/reconfiguration becomes hazardous.
+
+** Mutable hash tables as canonical messages/results
+
+Rejected as the primary public representation because invariants, printing, validation and extension compatibility become too implicit. Hash tables remain appropriate inside JSON/provider-native payloads.
+
+** Unbounded streaming queues
+
+Rejected because slow consumers can turn long-running streams or graph executions into uncontrolled memory growth.
+
+** Put provider-specific fields directly on core classes
+
+Rejected because every provider addition would pressure the canonical API. Stable common fields belong in core; provider-native data belongs in namespaced extensions.
+
+* Open design questions for maintainer approval
+
+These are the remaining choices that should be explicitly approved or changed before implementation authorization:
+
+1. CLOS classes versus =defstruct= for the highest-frequency immutable canonical values. This design allows a mixed approach; message/content extensibility favors CLOS while compact usage/event records may favor structures.
+2. Whether process default configuration is one global config object or a keyed registry by provider/profile. A keyed registry is likely more useful for REPL work.
+3. Exact default event-channel capacity and whether =:block= is the only production semantic overflow policy in v1.
+4. Whether the umbrella =llm-agent= package exports condition classes directly or expects advanced callers to use subsystem packages.
+5. Whether public =await= returns multiple values on cancellation/timeout or always signals typed conditions. This design recommends typed conditions for failures and ordinary values for success.
 
 * Non-goals
 
@@ -251,7 +1102,9 @@ Initial reference runtime is SBCL. Public semantic versioning begins immediately
 - no mandatory database;
 - no StarIntel schema or actor runtime;
 - no dependency classes as public API;
-- no hidden process-global conversation history.
+- no hidden process-global conversation history;
+- no requirement that every Common Lisp implementation be supported before 1.0;
+- no automatic remote JSON Schema fetching.
 
 * Related research
 
@@ -263,6 +1116,7 @@ Initial reference runtime is SBCL. Public semantic versioning begins immediately
 
 | Date | Change | Author or actor | Evidence |
 |------+--------+-----------------+----------|
+| 2026-08-12 | Expanded design with concrete CLOS/API sketches, lifecycle rules, sync/async semantics, state machines, diagrams, failure examples and implementation slices. | GPT-5.6 Sol | Maintainer request for more coded examples/design detail |
 | 2026-08-12 | Created core architecture, config, execution and canonical-value design. | GPT-5.6 Sol | Research 001, 006, 009 |
 
 * Footnotes and Glossary
@@ -270,3 +1124,5 @@ Initial reference runtime is SBCL. Public semantic versioning begins immediately
 - *Extension map*: provider-native data retained without contaminating standardized core fields.
 - *Monotonic deadline*: timeout deadline based on a clock unaffected by wall-clock jumps.
 - *Resolved configuration*: the concrete explicit/default/environment values selected for one operation.
+- *Logical immutability*: callers treat a published canonical value as immutable even if an implementation used mutation while constructing it.
+- *Terminal transition*: the one irreversible move of a future/channel from active/pending to resolved, rejected, cancelled or closed.
